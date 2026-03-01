@@ -448,26 +448,6 @@ fn send_to_appsrc(
         new_buf
     };
 
-    // Backpressure handling: wait if buffer is filling up
-    // This prevents frame drops by giving the client time to catch up
-    let threshold = appsrc.max_bytes() * 90 / 100; // 90% full
-    let mut wait_count = 0;
-    const MAX_WAITS: u32 = 5;
-    while appsrc.current_level_bytes() >= threshold && wait_count < MAX_WAITS {
-        wait_count += 1;
-        // Brief sleep to allow client to consume frames
-        std::thread::sleep(std::time::Duration::from_millis(10 * wait_count as u64));
-    }
-    if wait_count > 0 {
-        log::trace!(
-            "{}: Waited {}ms for buffer space (level: {}/{})",
-            appsrc.name(),
-            10 * wait_count * (wait_count + 1) / 2, // Sum of delays
-            appsrc.current_level_bytes(),
-            appsrc.max_bytes()
-        );
-    }
-
     // Push buffer into the appsrc
     match appsrc.push_buffer(buf) {
         Ok(_) => Ok(()),
