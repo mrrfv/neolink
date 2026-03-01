@@ -60,12 +60,15 @@ impl NeoRtspServer {
         factory.connect_client_connected(|_, client| {
             client.connect_new_session(|_, session| {
                 log::debug!("New Session");
-                // Session timeout too small causes us to drop
-                // some ffmpeg clients too soon
-                // Too long causes too many open connections with
-                // clients like frigate (that seem to open multiple
-                //   connections without shutting down old ones)
-                session.set_timeout(30);
+                // Session timeout controls how long before an idle session is dropped.
+                // - Too small: Drops clients during network jitter or slow consumption
+                // - Too large: Accumulates stale connections (e.g., Frigate opening multiple)
+                //
+                // Increased from 30s to 120s to handle:
+                // - Network jitter (common with WiFi cameras)
+                // - Slow client frame consumption (e.g., go2rtc buffering)
+                // - Client-side processing delays
+                session.set_timeout(120);
             });
         });
 

@@ -380,54 +380,108 @@ fn send_to_appsrc(
             return Ok(());
         }
     }
+
+    // Backpressure handling: wait if buffer is too full before creating and pushing.
+    // This prevents frame drops when clients temporarily can't consume fast enough.
+    //
+    // Strategy:
+    // - Check buffer level before pushing
+    // - If > 90% full, wait with exponential backoff
+    // - Max 5 retries (~310ms total wait)
+    // - If still full after retries, push anyway (may drop or block)
+    const MAX_RETRIES: u32 = 5;
+    const INITIAL_WAIT_MS: u64 = 10;
+    const BUFFER_THRESHOLD: u64 = 90; // Percent
+
+    let max_bytes = appsrc.max_bytes();
+    let threshold_bytes = max_bytes * BUFFER_THRESHOLD / 100;
+
+    let mut retries = 0;
+    let mut wait_ms = INITIAL_WAIT_MS;
+
+    while appsrc.current_level_bytes() >= threshold_bytes && retries < MAX_RETRIES {
+        retries += 1;
+        log::trace!(
+            "Buffer {:.0}% full on {}, waiting {}ms (retry {}/{})",
+            (appsrc.current_level_bytes() as f64 / max_bytes as f64) * 100.0,
+            appsrc.name(),
+            wait_ms,
+            retries,
+            MAX_RETRIES
+        );
+        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+        wait_ms *= 2; // Exponential backoff
+    }
+
+    if retries >= MAX_RETRIES {
+        log::debug!(
+            "Buffer still {:.0}% full on {} after {} retries, pushing anyway",
+            (appsrc.current_level_bytes() as f64 / max_bytes as f64) * 100.0,
+            appsrc.name(),
+            retries
+        );
+    }
+
+    let msg_size = data.len();
+
+    // Get or create a pool of this len
+    let pool = pools.entry(msg_size).or_insert_with_key(|size| {
+        let pool = gstreamer::BufferPool::new();
+        let mut pool_config = pool.config();
+        // Set a max buffers to ensure we don't grow in memory endlessly
+        pool_config.set_params(None, (*size) as u32, 8, 32);
+        pool.set_config(pool_config).unwrap();
+        pool.set_active(true).unwrap();
+        pool
+    });
+
+    // Get a buffer from the pool and then copy in the data
     let buf = {
-        let msg_size = data.len();
-
-        // Get or create a pool of this len
-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-            let pool = gstreamer::BufferPool::new();
-            let mut pool_config = pool.config();
-            // Set a max buffers to ensure we don't grow in memory endlessly
-            pool_config.set_params(None, (*size) as u32, 8, 32);
-            pool.set_config(pool_config).unwrap();
-            pool.set_active(true).unwrap();
-            pool
-        });
-
-        // Get a buffer from the pool and then copy in the data
-        let gst_buf = {
-            let mut new_buf = pool.acquire_buffer(None).unwrap();
-            let gst_buf_mut = new_buf.get_mut().unwrap();
-            let time = ClockTime::from_useconds(ts.as_micros() as u64);
-            gst_buf_mut.set_dts(time);
-            gst_buf_mut.set_pts(time);
-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
-            gst_buf_data.copy_from_slice(data.as_slice());
-            drop(gst_buf_data);
-            new_buf
-        };
-
-        // Return the new buffer with the data
-        gst_buf
+        let mut new_buf = pool.acquire_buffer(None).unwrap();
+        let gst_buf_mut = new_buf.get_mut().unwrap();
+        let time = ClockTime::from_useconds(ts.as_micros() as u64);
+        gst_buf_mut.set_dts(time);
+        gst_buf_mut.set_pts(time);
+        let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
+        gst_buf_data.copy_from_slice(data.as_slice());
+        drop(gst_buf_data);
+        new_buf
     };
+
+    // Backpressure handling: wait if buffer is filling up
+    // This prevents frame drops by giving the client time to catch up
+    let threshold = appsrc.max_bytes() * 90 / 100; // 90% full
+    let mut wait_count = 0;
+    const MAX_WAITS: u32 = 5;
+    while appsrc.current_level_bytes() >= threshold && wait_count < MAX_WAITS {
+        wait_count += 1;
+        // Brief sleep to allow client to consume frames
+        std::thread::sleep(std::time::Duration::from_millis(10 * wait_count as u64));
+    }
+    if wait_count > 0 {
+        log::trace!(
+            "{}: Waited {}ms for buffer space (level: {}/{})",
+            appsrc.name(),
+            10 * wait_count * (wait_count + 1) / 2, // Sum of delays
+            appsrc.current_level_bytes(),
+            appsrc.max_bytes()
+        );
+    }
 
     // Push buffer into the appsrc
     match appsrc.push_buffer(buf) {
-        Ok(_) => {
-            // log::info!(
-            //     "Send {}{} on {}",
-            //     data.data.len(),
-            //     if data.keyframe { " (keyframe)" } else { "" },
-            //     appsrc.name()
-            // );
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(FlowError::Flushing) => {
-            // Buffer is full just skip
-            log::info!(
-                "Buffer full on {} pausing stream until client consumes frames",
+            // Pipeline is flushing or client disconnected
+            log::debug!(
+                "Pipeline flushing on {}, client may have disconnected",
                 appsrc.name()
             );
+            Ok(())
+        }
+        Err(FlowError::Eos) => {
+            // End of stream - normal shutdown
+            log::debug!("EOS on {}", appsrc.name());
             Ok(())
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
@@ -959,9 +1013,9 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 
 fn buffer_size(bitrate: u32) -> u32 {
     // Buffer size based on bitrate:
-    // - Increased from 0.1s to 2s of video to handle client consumption delays
+    // - 2 seconds of video to handle client consumption delays
     // - This helps prevent "Buffer full" warnings during network jitter
     // - Minimum 1MB for low bitrate streams
     // Formula: bitrate (bits/s) * 2 seconds / 8 (bits to bytes)
-    std::cmp::max(bitrate * 2 / 8u32 * 20, 1024u32 * 1024u32)
+    std::cmp::max(bitrate * 2 / 8, 1024u32 * 1024u32)
 }
