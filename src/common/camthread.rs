@@ -8,6 +8,37 @@ use tokio_util::sync::CancellationToken;
 use crate::{config::CameraConfig, utils::connect_and_login, AnyResult};
 use neolink_core::bc_protocol::BcCamera;
 
+// =============================================================================
+// Camera Keepalive Configuration
+// =============================================================================
+// These control how we detect if a camera connection is still alive.
+//
+// Detection time calculation:
+//   Total = PING_INTERVAL × MAX_MISSED_PINGS = 15s × 10 = 150 seconds
+//
+// This is intentionally longer than TCP keepalive (120s) because:
+// - TCP keepalive detects network-level failures (cable unplugged, router down)
+// - Ping detects application-level failures (camera firmware hang, protocol error)
+// - During high video traffic, pings compete with video frames for channel space
+//
+// Trade-offs:
+// - Shorter intervals = faster detection, but more load during streaming
+// - Longer timeouts = more resilient to transient delays, but slower detection
+
+/// How often to send a ping to check if the camera is responsive
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long to wait for a ping response before counting it as missed
+/// Longer than ping interval to handle message channel backpressure during video streaming
+const PING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Number of consecutive missed pings before declaring the connection dead
+const MAX_MISSED_PINGS: u32 = 10;
+
+/// Delay after connection to allow camera firmware to fully initialize
+/// Some cameras return errors if queried too quickly after login
+const CAMERA_WAKEUP_DELAY: Duration = Duration::from_secs(2);
+
 #[derive(Eq, PartialEq, Copy, Clone)]
 pub(crate) enum NeoCamThreadState {
     Connected,
@@ -41,11 +72,11 @@ impl NeoCamThread {
         let camera = Arc::new(connect_and_login(config).await?);
         log::trace!("  - Connected");
 
-        sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
+        sleep(CAMERA_WAKEUP_DELAY).await;
         if let Err(e) = update_camera_time(&camera, &name, config.update_time).await {
             log::warn!("Could not set camera time, (perhaps missing on this camera of your login in not an admin): {e:?}");
         }
-        sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
+        sleep(CAMERA_WAKEUP_DELAY).await;
 
         self.camera_watch.send_replace(Arc::downgrade(&camera));
 
@@ -60,22 +91,12 @@ impl NeoCamThread {
                 Ok(())
             },
             v = async {
-                // Ping interval: how often we check if camera is alive
-                // Increased from 5s to 15s to reduce load on message channel
-                let mut interval = interval(Duration::from_secs(15));
+                let mut ping_interval = interval(PING_INTERVAL);
                 let mut missed_pings = 0;
-                // Max missed pings before declaring connection dead
-                // Increased from 5 to 10 for resilience during high video traffic
-                // Total detection time: 15s * 10 = 150s (2.5 minutes)
-                // Note: TCP keepalive (120s) provides faster detection for network failures
-                const MAX_MISSED_PINGS: u32 = 10;
                 loop {
-                    interval.tick().await;
+                    ping_interval.tick().await;
                     log::trace!("Sending ping");
-                    // Ping timeout: how long to wait for a response
-                    // Increased from 5s to 30s to handle message channel backpressure
-                    // When video frames fill the channel, ping responses may be delayed
-                    match timeout(Duration::from_secs(30), camera.get_linktype()).await {
+                    match timeout(PING_TIMEOUT, camera.get_linktype()).await {
                         Ok(Ok(_)) => {
                             log::trace!("Ping reply received");
                             missed_pings = 0;

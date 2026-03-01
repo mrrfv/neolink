@@ -28,6 +28,16 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// RTSP session timeout in seconds
+///
+/// Controls how long an idle RTSP session persists before being dropped.
+/// Aligned with TCP keepalive (120s) for consistent connection lifecycle.
+///
+/// Trade-offs:
+/// - Shorter = faster cleanup of stale sessions, less memory
+/// - Longer = more resilient to network jitter and slow clients
+const RTSP_SESSION_TIMEOUT_SECS: u32 = 120;
+
 glib::wrapper! {
     /// The wrapped RTSPServer
     pub(crate) struct NeoRtspServer(ObjectSubclass<NeoRtspServerImpl>) @extends RTSPServer;
@@ -60,15 +70,7 @@ impl NeoRtspServer {
         factory.connect_client_connected(|_, client| {
             client.connect_new_session(|_, session| {
                 log::debug!("New Session");
-                // Session timeout controls how long before an idle session is dropped.
-                // - Too small: Drops clients during network jitter or slow consumption
-                // - Too large: Accumulates stale connections (e.g., Frigate opening multiple)
-                //
-                // Increased from 30s to 120s to handle:
-                // - Network jitter (common with WiFi cameras)
-                // - Slow client frame consumption (e.g., go2rtc buffering)
-                // - Client-side processing delays
-                session.set_timeout(120);
+                session.set_timeout(RTSP_SESSION_TIMEOUT_SECS);
             });
         });
 
@@ -103,18 +105,26 @@ impl NeoRtspServer {
                 if let Some(sessions) = clean_up_server.session_pool() {
                     let cleanups = sessions.cleanup();
                     if cleanups > 0 {
-                        log::debug!("Cleaned up {cleanups} sessions");
+                        log::debug!("Cleaned up {cleanups} stale sessions");
                     }
+
+                    // Count and log active sessions for monitoring
+                    let mut active_count = 0u32;
                     sessions.filter(Some(&mut |_, session| {
+                        active_count += 1;
                         let remaining = session.next_timeout_usec(glib::monotonic_time());
-                        log::debug!(
-                            "{:?}: {}/{}",
+                        log::trace!(
+                            "Session {:?}: {}us until timeout (max {}s)",
                             session.sessionid(),
                             remaining,
                             session.timeout(),
                         );
                         RTSPFilterResult::Keep
                     }));
+
+                    if active_count > 0 {
+                        log::debug!("Active RTSP sessions: {}", active_count);
+                    }
                 }
                 std::thread::sleep(Duration::from_secs(5));
             }

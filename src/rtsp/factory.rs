@@ -14,6 +14,13 @@ use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
 
+/// Audio buffer size in bytes
+///
+/// Audio typically runs at ~800kbps. This buffer provides ~7 seconds of audio
+/// which is larger than video (2 seconds) to ensure smooth playback.
+/// Formula: 512 packets × 1416 bytes/packet ≈ 725KB
+const AUDIO_BUFFER_SIZE: u32 = 512 * 1416;
+
 #[derive(Clone, Debug)]
 pub enum AudioType {
     Aac,
@@ -647,8 +654,7 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
 }
 
 fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    // Audio seems to run at about 800kbs
-    let buffer_size = 512 * 1416;
+    let buffer_size = AUDIO_BUFFER_SIZE;
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
@@ -805,8 +811,7 @@ fn build_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> 
 
 #[allow(dead_code)]
 fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    // Audio seems to run at about 800kbs
-    let buffer_size = 512 * 1416;
+    let buffer_size = AUDIO_BUFFER_SIZE;
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()

@@ -13,6 +13,33 @@ use tokio_util::sync::CancellationToken;
 
 use tokio::{sync::RwLock, task::JoinSet};
 
+// =============================================================================
+// Channel Capacity Constants
+// =============================================================================
+// These control buffering between camera protocol and consumers (RTSP, etc.)
+//
+// Sizing rationale:
+// - At 30fps H.264, each frame is a Bc message (~1-10KB depending on I/P frame)
+// - 500 messages ≈ 16 seconds of video at 30fps
+// - Larger buffers prevent frame drops during transient client slowdowns
+// - Memory cost: ~500 × avg_frame_size ≈ 2-5MB per active stream
+//
+// Trade-offs:
+// - Larger = more resilient to jitter, but higher memory and latency
+// - Smaller = lower latency, but more prone to frame drops
+
+/// Capacity for outgoing message channel (camera → subscribers)
+/// Sized for ~16 seconds of video frames at 30fps
+const MESSAGE_CHANNEL_CAPACITY: usize = 500;
+
+/// Capacity for internal poll command routing
+/// Higher than message capacity to prevent command starvation during high video traffic
+const POLL_COMMAND_CAPACITY: usize = 1000;
+
+/// Capacity for individual subscriber channels
+/// Matches message channel to prevent asymmetric backpressure
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 500;
+
 type MsgHandler = dyn 'static + Send + Sync + for<'a> Fn(&'a Bc) -> BoxFuture<'a, Option<Bc>>;
 
 #[derive(Default)]
@@ -43,15 +70,10 @@ pub struct BcConnection {
 
 impl BcConnection {
     pub async fn new(mut sink: BcConnSink, mut source: BcConnSource) -> Result<BcConnection> {
-        // Message channel capacity for outgoing messages
-        // Increased from 100 to 500 to handle high video frame rates
-        // Video streams can generate many frames/second that need buffering
-        let (sinker, sinker_rx) = channel::<Result<Bc>>(500);
+        let (sinker, sinker_rx) = channel::<Result<Bc>>(MESSAGE_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
 
-        // Poll command channel for internal message routing
-        // Increased from 200 to 1000 to handle incoming video frames
-        let (poll_commander, poll_commanded) = channel(1000);
+        let (poll_commander, poll_commanded) = channel(POLL_COMMAND_CAPACITY);
         let mut poller = Poller {
             subscribers: Default::default(),
             sink: sinker.clone(),
@@ -119,9 +141,7 @@ impl BcConnection {
     }
 
     pub async fn subscribe(&self, msg_id: u32, msg_num: u16) -> Result<BcSubscription> {
-        // Subscriber channel capacity - increased from 100 to 500
-        // Video streams need larger buffers to prevent backpressure
-        let (tx, rx) = channel(500);
+        let (tx, rx) = channel(SUBSCRIBER_CHANNEL_CAPACITY);
         self.poll_commander
             .send(PollCommand::AddSubscriber(msg_id, Some(msg_num), tx))
             .await?;
@@ -158,8 +178,7 @@ impl BcConnection {
     ///
     /// This function creates a temporary handle to grab this single message
     pub async fn subscribe_to_id(&self, msg_id: u32) -> Result<BcSubscription> {
-        // Subscriber channel capacity - increased from 100 to 500
-        let (tx, rx) = channel(500);
+        let (tx, rx) = channel(SUBSCRIBER_CHANNEL_CAPACITY);
         self.poll_commander
             .send(PollCommand::AddSubscriber(msg_id, None, tx))
             .await?;
@@ -317,20 +336,30 @@ impl Poller {
                                         None
                                     };
                                     if let Some(sender) = sender {
-                                        if sender.capacity() == 0 {
-                                            warn!("Reaching limit of channel");
+                                        let capacity = sender.capacity();
+                                        let max_capacity = sender.max_capacity();
+                                        let threshold = max_capacity / 10; // 10% remaining
+
+                                        if capacity == 0 {
                                             warn!(
-                                                "Remaining: {} of {} message space for {} (ID: {})",
-                                                sender.capacity(),
-                                                sender.max_capacity(),
+                                                "Channel full for msg {} (ID: {}), frame may be dropped",
+                                                &msg_num,
+                                                &msg_id
+                                            );
+                                        } else if capacity <= threshold {
+                                            // Early warning when approaching capacity
+                                            debug!(
+                                                "Channel filling: {}/{} remaining for msg {} (ID: {})",
+                                                capacity,
+                                                max_capacity,
                                                 &msg_num,
                                                 &msg_id
                                             );
                                         } else {
                                             trace!(
-                                                "Remaining: {} of {} message space for {} (ID: {})",
-                                                sender.capacity(),
-                                                sender.max_capacity(),
+                                                "Channel: {}/{} for msg {} (ID: {})",
+                                                capacity,
+                                                max_capacity,
                                                 &msg_num,
                                                 &msg_id
                                             );

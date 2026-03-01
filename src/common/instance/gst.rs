@@ -8,6 +8,11 @@ use tokio::sync::mpsc::Receiver as MpscReceiver;
 #[cfg(feature = "pushnoti")]
 use crate::common::PushNoti;
 
+/// Channel capacity for buffering video frames between camera and RTSP server
+/// At 30fps, 500 frames ≈ 16 seconds of buffering capacity
+/// This handles client-side consumption delays and network jitter
+const MEDIA_CHANNEL_CAPACITY: usize = 500;
+
 impl NeoInstance {
     /// Streams a camera source while not paused
     pub(crate) async fn stream_while_live(
@@ -18,12 +23,7 @@ impl NeoInstance {
         let name = config.name.clone();
 
         let media_rx = if config.pause.on_motion {
-            // Channel capacity for buffering video frames between camera and RTSP server.
-            // Increased from 100 to 500 to handle:
-            // - Client-side consumption delays (network jitter, processing)
-            // - Temporary backpressure from slow RTSP clients
-            // At 30fps, 500 frames = ~16 seconds of buffering capacity
-            let (media_tx, media_rx) = tokio::sync::mpsc::channel(500);
+            let (media_tx, media_rx) = tokio::sync::mpsc::channel(MEDIA_CHANNEL_CAPACITY);
             let counter = UseCounter::new().await;
 
             let mut md = self.motion().await?;
@@ -181,8 +181,7 @@ impl NeoInstance {
 
     /// Streams a camera source
     pub(crate) async fn stream(&self, stream: StreamKind) -> AnyResult<MpscReceiver<BcMedia>> {
-        // Channel capacity for buffering video frames - see stream_while_live() for details
-        let (media_tx, media_rx) = tokio::sync::mpsc::channel(500);
+        let (media_tx, media_rx) = tokio::sync::mpsc::channel(MEDIA_CHANNEL_CAPACITY);
         let config = self.config().await?.borrow().clone();
         let strict = config.strict;
         let thread_camera = self.clone();
