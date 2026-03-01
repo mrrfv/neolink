@@ -38,6 +38,11 @@ features not yet in upstream master.
 - More ways to connect to the camera. Including Relaying through reolink
   servers
 - Camera battery levels can be displayed in the log
+- Connection stability improvements:
+  - TCP keepalive for dead connection detection
+  - Larger message buffers to handle network jitter
+  - Backpressure handling to prevent frame drops
+  - Improved RTSP session timeout handling
 
 ## Installation
 
@@ -605,6 +610,54 @@ neolink ptz --config=config.toml CameraName zoom 2.5
 ```
 
 With 1.0 being normal and 2.5 being 2.5x zoom
+
+## Troubleshooting
+
+### Connection Issues
+
+If you experience frequent disconnections or stream interruptions:
+
+1. **Enable debug logging** to see what's happening:
+   ```bash
+   RUST_LOG=debug ./neolink rtsp --config=neolink.toml
+   ```
+
+2. **Check for these common issues**:
+   - "Ping timeout" messages: Camera may be overloaded or network is congested
+   - "Channel full" warnings: Client is consuming frames too slowly
+   - "Buffer overflow" warnings: Consider using a lower resolution stream
+
+3. **Network recommendations**:
+   - Use wired connections when possible (WiFi can cause jitter)
+   - Ensure camera and neolink are on the same subnet for local discovery
+   - If using remote/relay discovery, ensure stable internet connection
+
+### Performance Tuning
+
+Neolink uses internal buffers to handle network jitter and client delays:
+
+- **Video buffers**: ~2 seconds of video per stream
+- **Message channels**: ~16 seconds of frames at 30fps
+- **RTSP sessions**: 120 second idle timeout
+
+These values are tuned for reliability. If you need lower latency, consider
+using the `subStream` instead of `mainStream`:
+
+```toml
+[[cameras]]
+name = "camera"
+stream = "subStream"
+```
+
+### Debug Output
+
+Set `debug = true` in your camera config to see protocol-level messages:
+
+```toml
+[[cameras]]
+name = "camera"
+debug = true
+```
 
 ## License
 
