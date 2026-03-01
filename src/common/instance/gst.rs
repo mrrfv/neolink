@@ -210,3 +210,36 @@ impl NeoInstance {
         Ok(media_rx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify media channel capacity is sized for video buffering
+    #[test]
+    fn test_media_channel_capacity() {
+        // At 30fps, should buffer several seconds of video
+        let buffer_seconds = MEDIA_CHANNEL_CAPACITY as f64 / 30.0;
+
+        assert!(
+            buffer_seconds >= 10.0,
+            "Media channel only buffers {:.1}s of video at 30fps",
+            buffer_seconds
+        );
+        assert!(
+            buffer_seconds <= 60.0,
+            "Media channel buffers {:.1}s, may use excessive memory",
+            buffer_seconds
+        );
+    }
+
+    /// Verify capacity hasn't regressed to old value
+    #[test]
+    fn test_media_channel_not_regressed() {
+        // Pre-fix value was 100
+        assert!(
+            MEDIA_CHANNEL_CAPACITY >= 500,
+            "Media channel capacity regressed below 500"
+        );
+    }
+}

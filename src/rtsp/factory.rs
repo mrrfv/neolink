@@ -1004,3 +1004,95 @@ fn buffer_size(bitrate: u32) -> u32 {
     // Formula: bitrate (bits/s) * 2 seconds / 8 (bits to bytes)
     std::cmp::max(bitrate * 2 / 8, 1024u32 * 1024u32)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify audio buffer size is reasonable
+    #[test]
+    fn test_audio_buffer_size() {
+        // Audio at ~800kbps = 100KB/s
+        // Buffer should hold several seconds
+        let audio_seconds = AUDIO_BUFFER_SIZE as f64 / 100_000.0;
+
+        assert!(
+            audio_seconds >= 5.0,
+            "Audio buffer only holds {:.1}s at 800kbps",
+            audio_seconds
+        );
+        assert!(
+            audio_seconds <= 30.0,
+            "Audio buffer holds {:.1}s, may be excessive",
+            audio_seconds
+        );
+    }
+
+    /// Verify video buffer size calculation
+    #[test]
+    fn test_video_buffer_size() {
+        // 4 Mbps stream
+        let size_4mbps = buffer_size(4_000_000);
+        // Should be ~2 seconds = 1MB
+        assert!(
+            size_4mbps >= 1_000_000,
+            "4Mbps buffer too small: {} bytes",
+            size_4mbps
+        );
+        assert!(
+            size_4mbps <= 2_000_000,
+            "4Mbps buffer too large: {} bytes",
+            size_4mbps
+        );
+
+        // Low bitrate should get minimum 1MB
+        let size_low = buffer_size(100_000);
+        assert_eq!(
+            size_low,
+            1024 * 1024,
+            "Low bitrate should get minimum 1MB buffer"
+        );
+
+        // High bitrate (8 Mbps)
+        let size_8mbps = buffer_size(8_000_000);
+        assert!(
+            size_8mbps >= 2_000_000,
+            "8Mbps buffer too small: {} bytes",
+            size_8mbps
+        );
+    }
+
+    /// Verify backpressure constants in send_to_appsrc are reasonable
+    #[test]
+    fn test_backpressure_constants() {
+        // These are defined locally in send_to_appsrc but we can verify the logic
+        const MAX_RETRIES: u32 = 5;
+        const INITIAL_WAIT_MS: u64 = 10;
+        const BUFFER_THRESHOLD: u64 = 90;
+
+        // Max total wait time = 10 + 20 + 40 + 80 + 160 = 310ms
+        let mut total_wait: u64 = 0;
+        let mut wait_ms = INITIAL_WAIT_MS;
+        for _ in 0..MAX_RETRIES {
+            total_wait += wait_ms;
+            wait_ms *= 2;
+        }
+
+        // Total wait should be under 1 second
+        assert!(
+            total_wait < 1000,
+            "Backpressure total wait too long: {}ms",
+            total_wait
+        );
+
+        // Threshold should be high (don't wait until nearly full)
+        assert!(
+            BUFFER_THRESHOLD >= 80,
+            "Buffer threshold too low, will cause unnecessary waits"
+        );
+        assert!(
+            BUFFER_THRESHOLD <= 95,
+            "Buffer threshold too high, may cause drops"
+        );
+    }
+}

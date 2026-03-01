@@ -271,3 +271,31 @@ impl NeoRtspServerImpl {
         Ok(locked_users.keys().cloned().collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify RTSP session timeout is reasonable
+    #[test]
+    fn test_rtsp_session_timeout() {
+        // Should be long enough to handle network jitter
+        assert!(
+            RTSP_SESSION_TIMEOUT_SECS >= 60,
+            "RTSP session timeout too short, may drop clients during jitter"
+        );
+
+        // Should not be excessively long (accumulates stale sessions)
+        assert!(
+            RTSP_SESSION_TIMEOUT_SECS <= 300,
+            "RTSP session timeout too long, may accumulate stale sessions"
+        );
+
+        // Should be aligned with TCP keepalive for consistency
+        // TCP keepalive is typically 120s
+        assert!(
+            RTSP_SESSION_TIMEOUT_SECS >= 120,
+            "RTSP timeout should be >= TCP keepalive (120s)"
+        );
+    }
+}

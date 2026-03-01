@@ -261,3 +261,73 @@ async fn update_camera_time(camera: &BcCamera, name: &str, update_time: bool) ->
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify ping timing constants are configured correctly
+    #[test]
+    fn test_ping_timing_constants() {
+        // Ping interval should be reasonable (not too aggressive, not too slow)
+        assert!(
+            PING_INTERVAL >= Duration::from_secs(5),
+            "Ping interval too aggressive, will cause excessive traffic"
+        );
+        assert!(
+            PING_INTERVAL <= Duration::from_secs(60),
+            "Ping interval too slow, detection will take too long"
+        );
+
+        // Ping timeout should be longer than ping interval
+        // to handle backpressure during high traffic
+        assert!(
+            PING_TIMEOUT >= PING_INTERVAL,
+            "Ping timeout should be >= ping interval"
+        );
+
+        // Max missed pings should allow for transient failures
+        assert!(
+            MAX_MISSED_PINGS >= 3,
+            "Too few missed pings allowed, will cause spurious disconnects"
+        );
+        assert!(
+            MAX_MISSED_PINGS <= 20,
+            "Too many missed pings allowed, detection too slow"
+        );
+    }
+
+    /// Verify total detection time is reasonable
+    #[test]
+    fn test_total_detection_time() {
+        // Total detection time = PING_INTERVAL * MAX_MISSED_PINGS
+        let total_detection = PING_INTERVAL.as_secs() * MAX_MISSED_PINGS as u64;
+
+        // Should detect within 5 minutes
+        assert!(
+            total_detection <= 300,
+            "Total detection time too long: {}s",
+            total_detection
+        );
+
+        // Should not be faster than TCP keepalive (120s) for network issues
+        // TCP keepalive handles network failures; ping handles application issues
+        assert!(
+            total_detection >= 60,
+            "Detection time shorter than TCP keepalive, may cause duplicate detection"
+        );
+    }
+
+    /// Verify camera wakeup delay is reasonable
+    #[test]
+    fn test_camera_wakeup_delay() {
+        assert!(
+            CAMERA_WAKEUP_DELAY >= Duration::from_secs(1),
+            "Camera wakeup delay too short"
+        );
+        assert!(
+            CAMERA_WAKEUP_DELAY <= Duration::from_secs(10),
+            "Camera wakeup delay too long"
+        );
+    }
+}

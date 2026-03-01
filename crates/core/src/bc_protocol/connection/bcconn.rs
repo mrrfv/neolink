@@ -440,3 +440,57 @@ impl Poller {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify channel capacity constants are sized appropriately
+    /// These values affect memory usage and buffering behavior
+    #[test]
+    fn test_channel_capacities_are_reasonable() {
+        // Message channel should hold several seconds of video at 30fps
+        // 500 / 30fps = ~16 seconds
+        assert!(
+            MESSAGE_CHANNEL_CAPACITY >= 100,
+            "Message channel too small for video buffering"
+        );
+        assert!(
+            MESSAGE_CHANNEL_CAPACITY <= 2000,
+            "Message channel too large, excessive memory use"
+        );
+
+        // Poll command channel should be larger than message channel
+        // to prevent command starvation
+        assert!(
+            POLL_COMMAND_CAPACITY > MESSAGE_CHANNEL_CAPACITY,
+            "Poll command channel should be larger than message channel"
+        );
+
+        // Subscriber channel should match message channel
+        // to prevent asymmetric backpressure
+        assert_eq!(
+            SUBSCRIBER_CHANNEL_CAPACITY, MESSAGE_CHANNEL_CAPACITY,
+            "Subscriber and message channels should match"
+        );
+    }
+
+    /// Verify that capacity values haven't accidentally regressed
+    /// to old smaller values
+    #[test]
+    fn test_channel_capacities_not_regressed() {
+        // Pre-fix values were 100/200/100 - ensure we haven't regressed
+        assert!(
+            MESSAGE_CHANNEL_CAPACITY >= 500,
+            "Message channel capacity regressed below 500"
+        );
+        assert!(
+            POLL_COMMAND_CAPACITY >= 1000,
+            "Poll command capacity regressed below 1000"
+        );
+        assert!(
+            SUBSCRIBER_CHANNEL_CAPACITY >= 500,
+            "Subscriber channel capacity regressed below 500"
+        );
+    }
+}
