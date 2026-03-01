@@ -958,6 +958,10 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 }
 
 fn buffer_size(bitrate: u32) -> u32 {
-    // 0.1 seconds (according to bitrate) or 4kb what ever is larger
-    std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+    // Buffer size based on bitrate:
+    // - Increased from 0.1s to 2s of video to handle client consumption delays
+    // - This helps prevent "Buffer full" warnings during network jitter
+    // - Minimum 1MB for low bitrate streams
+    // Formula: bitrate (bits/s) * 2 seconds / 8 (bits to bytes)
+    std::cmp::max(bitrate * 2 / 8u32 * 20, 1024u32 * 1024u32)
 }

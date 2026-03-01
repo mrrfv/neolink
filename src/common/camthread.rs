@@ -60,14 +60,24 @@ impl NeoCamThread {
                 Ok(())
             },
             v = async {
-                let mut interval = interval(Duration::from_secs(5));
+                // Ping interval: how often we check if camera is alive
+                // Increased from 5s to 15s to reduce load on message channel
+                let mut interval = interval(Duration::from_secs(15));
                 let mut missed_pings = 0;
+                // Max missed pings before declaring connection dead
+                // Increased from 5 to 10 for resilience during high video traffic
+                // Total detection time: 15s * 10 = 150s (2.5 minutes)
+                // Note: TCP keepalive (120s) provides faster detection for network failures
+                const MAX_MISSED_PINGS: u32 = 10;
                 loop {
                     interval.tick().await;
                     log::trace!("Sending ping");
-                    match timeout(Duration::from_secs(5), camera.get_linktype()).await {
+                    // Ping timeout: how long to wait for a response
+                    // Increased from 5s to 30s to handle message channel backpressure
+                    // When video frames fill the channel, ping responses may be delayed
+                    match timeout(Duration::from_secs(30), camera.get_linktype()).await {
                         Ok(Ok(_)) => {
-                            log::trace!("Ping reply");
+                            log::trace!("Ping reply received");
                             missed_pings = 0;
                             continue
                         },
@@ -81,11 +91,12 @@ impl NeoCamThread {
                         },
                         Err(_) => {
                             // Timeout
-                            if missed_pings < 5 {
-                                missed_pings += 1;
+                            missed_pings += 1;
+                            if missed_pings < MAX_MISSED_PINGS {
+                                log::debug!("Ping timeout ({}/{}), will retry", missed_pings, MAX_MISSED_PINGS);
                                 continue;
                             } else {
-                                log::error!("Timed out waiting for camera ping reply");
+                                log::error!("Timed out waiting for camera ping reply ({} consecutive failures)", missed_pings);
                                 break Err(anyhow::anyhow!("Timed out waiting for camera ping reply"));
                             }
                         }

@@ -43,10 +43,15 @@ pub struct BcConnection {
 
 impl BcConnection {
     pub async fn new(mut sink: BcConnSink, mut source: BcConnSource) -> Result<BcConnection> {
-        let (sinker, sinker_rx) = channel::<Result<Bc>>(100);
+        // Message channel capacity for outgoing messages
+        // Increased from 100 to 500 to handle high video frame rates
+        // Video streams can generate many frames/second that need buffering
+        let (sinker, sinker_rx) = channel::<Result<Bc>>(500);
         let cancel = CancellationToken::new();
 
-        let (poll_commander, poll_commanded) = channel(200);
+        // Poll command channel for internal message routing
+        // Increased from 200 to 1000 to handle incoming video frames
+        let (poll_commander, poll_commanded) = channel(1000);
         let mut poller = Poller {
             subscribers: Default::default(),
             sink: sinker.clone(),
@@ -114,7 +119,9 @@ impl BcConnection {
     }
 
     pub async fn subscribe(&self, msg_id: u32, msg_num: u16) -> Result<BcSubscription> {
-        let (tx, rx) = channel(100);
+        // Subscriber channel capacity - increased from 100 to 500
+        // Video streams need larger buffers to prevent backpressure
+        let (tx, rx) = channel(500);
         self.poll_commander
             .send(PollCommand::AddSubscriber(msg_id, Some(msg_num), tx))
             .await?;
@@ -151,7 +158,8 @@ impl BcConnection {
     ///
     /// This function creates a temporary handle to grab this single message
     pub async fn subscribe_to_id(&self, msg_id: u32) -> Result<BcSubscription> {
-        let (tx, rx) = channel(100);
+        // Subscriber channel capacity - increased from 100 to 500
+        let (tx, rx) = channel(500);
         self.poll_commander
             .send(PollCommand::AddSubscriber(msg_id, None, tx))
             .await?;
