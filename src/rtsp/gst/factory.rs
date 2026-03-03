@@ -35,11 +35,18 @@ impl Default for NeoMediaFactory {
 impl NeoMediaFactory {
     fn new() -> Self {
         let factory = Object::new::<NeoMediaFactory>();
-        factory.set_shared(false);
+        // Share one pipeline among all RTSP clients. With set_shared(false),
+        // each client (go2rtc, ffprobe, etc.) creates its own GStreamer pipeline
+        // and camera stream session. Repeated connect/disconnect cycles exhaust
+        // the RTSP server's resources and make it unresponsive.
+        factory.set_shared(true);
         factory.set_eos_shutdown(false);
         factory.set_stop_on_disconnect(false);
-        // factory.set_publish_clock_mode(gstreamer_rtsp_server::RTSPPublishClockMode::Clock);
-        factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::Reset);
+        // Keep the pipeline alive across session suspend/resume. Reset mode
+        // tears down and rebuilds the entire pipeline on every RTSP session
+        // change, which combined with reconnection retries from go2rtc causes
+        // the RTSP server to lock up with CLOSE-WAIT connections.
+        factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::None);
         factory.set_launch("videotestsrc pattern=\"snow\" ! video/x-raw,width=896,height=512,framerate=25/1 ! textoverlay name=\"inittextoverlay\" text=\"Stream not Ready\" valignment=top halignment=left font-desc=\"Sans, 32\" ! jpegenc ! rtpjpegpay name=pay0");
         factory.set_transport_mode(RTSPTransportMode::PLAY);
         factory
