@@ -382,34 +382,46 @@ impl Poller {
                                         let threshold = max_capacity / 10; // 10% remaining
 
                                         if capacity == 0 {
-                                            // Channel at capacity - send will block until space available
-                                            warn!(
-                                                "Channel at capacity for msg {} (ID: {}), send will block",
-                                                &msg_num,
-                                                &msg_id
-                                            );
-                                        } else if capacity <= threshold {
-                                            // Early warning when approaching capacity (< 10% remaining)
-                                            debug!(
-                                                "Channel low: {}/{} for msg {} (ID: {})",
-                                                capacity, max_capacity, &msg_num, &msg_id
-                                            );
+                                            // Channel full - use try_send to avoid blocking.
+                                            // Blocking here would stall the entire message loop,
+                                            // preventing keepalive ping responses and causing
+                                            // camera connection timeouts.
+                                            match sender.try_send(Ok(response)) {
+                                                Ok(()) => {},
+                                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                    debug!(
+                                                        "Channel full, dropping frame for msg {} (ID: {})",
+                                                        &msg_num, &msg_id
+                                                    );
+                                                },
+                                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                    debug!(
+                                                        "Channel closed for msg {} (ID: {})",
+                                                        &msg_num, &msg_id
+                                                    );
+                                                },
+                                            }
                                         } else {
-                                            trace!(
-                                                "Channel: {}/{} for msg {} (ID: {})",
-                                                capacity,
-                                                max_capacity,
-                                                &msg_num,
-                                                &msg_id
-                                            );
-                                        }
-                                        if let Err(e) = sender.send(Ok(response)).await {
-                                            // Log frame drops for visibility - important for ALPR
-                                            // to understand why detection rates may drop
-                                            warn!(
-                                                "Frame dropped for msg {} (ID: {}): {}",
-                                                msg_num, msg_id, e
-                                            );
+                                            if capacity <= threshold {
+                                                debug!(
+                                                    "Channel low: {}/{} for msg {} (ID: {})",
+                                                    capacity, max_capacity, &msg_num, &msg_id
+                                                );
+                                            } else {
+                                                trace!(
+                                                    "Channel: {}/{} for msg {} (ID: {})",
+                                                    capacity,
+                                                    max_capacity,
+                                                    &msg_num,
+                                                    &msg_id
+                                                );
+                                            }
+                                            if let Err(e) = sender.send(Ok(response)).await {
+                                                warn!(
+                                                    "Frame dropped for msg {} (ID: {}): {}",
+                                                    msg_num, msg_id, e
+                                                );
+                                            }
                                         }
                                     } else {
                                         trace!(
