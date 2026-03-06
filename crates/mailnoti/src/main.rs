@@ -22,7 +22,19 @@ use utils::find_and_connect;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            use std::io::Write;
+            writeln!(
+                buf,
+                "{} {} [{}] {}",
+                buf.timestamp_millis(),
+                record.level(),
+                record.module_path().unwrap_or("unknown"),
+                record.args()
+            )
+        })
+        .init();
 
     let opt = Opt::parse();
 

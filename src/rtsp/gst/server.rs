@@ -68,9 +68,13 @@ impl NeoRtspServer {
         factory.set_auth(Some(&auth));
 
         factory.connect_client_connected(|_, client| {
+            log::info!("RTSP client connected");
             client.connect_new_session(|_, session| {
-                log::debug!("New Session");
+                log::info!("New RTSP session (timeout={}s)", RTSP_SESSION_TIMEOUT_SECS);
                 session.set_timeout(RTSP_SESSION_TIMEOUT_SECS);
+            });
+            client.connect_closed(|_| {
+                log::info!("RTSP client disconnected");
             });
         });
 

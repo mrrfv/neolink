@@ -177,7 +177,7 @@ pub(super) async fn make_factory(
         while let Some(msg) = client_rx.recv().await {
             match msg {
                 ClientMsg::NewClient { element, reply } => {
-                    log::debug!("New client for {name}::{stream}");
+                    log::info!("New RTSP client for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
                     tokio::task::spawn(async move {
@@ -843,11 +843,13 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     bin.add_many([&source, &queue, &decoder, &encoder])?;
     Element::link_many([&source, &queue, &decoder])?;
     decoder.connect_pad_added(move |_element, pad| {
-        let sink_pad = encoder
-            .static_pad("sink")
-            .expect("Encoder is missing its pad");
-        pad.link(&sink_pad)
-            .expect("Failed to link ADPCM decoder to encoder");
+        let Some(sink_pad) = encoder.static_pad("sink") else {
+            log::error!("Encoder is missing its sink pad");
+            return;
+        };
+        if let Err(e) = pad.link(&sink_pad) {
+            log::error!("Failed to link ADPCM decoder to encoder: {:?}", e);
+        }
     });
 
     let source = source
@@ -1029,15 +1031,19 @@ fn make_dbl_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 
     let pad = queue
         .static_pad("sink")
-        .expect("Failed to get a static pad from queue.");
-    let ghost_pad = GhostPad::builder_with_target(&pad).unwrap().build();
+        .ok_or_else(|| anyhow!("Failed to get sink pad from queue"))?;
+    let ghost_pad = GhostPad::builder_with_target(&pad)
+        .map_err(|e| anyhow!("Failed to build ghost pad for queue sink: {:?}", e))?
+        .build();
     ghost_pad.set_active(true)?;
     bin.add_pad(&ghost_pad)?;
 
     let pad = queue2
         .static_pad("src")
-        .expect("Failed to get a static pad from queue2.");
-    let ghost_pad = GhostPad::builder_with_target(&pad).unwrap().build();
+        .ok_or_else(|| anyhow!("Failed to get src pad from queue2"))?;
+    let ghost_pad = GhostPad::builder_with_target(&pad)
+        .map_err(|e| anyhow!("Failed to build ghost pad for queue2 src: {:?}", e))?
+        .build();
     ghost_pad.set_active(true)?;
     bin.add_pad(&ghost_pad)?;
 

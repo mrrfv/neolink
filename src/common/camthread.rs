@@ -68,13 +68,15 @@ impl NeoCamThread {
     }
     async fn run_camera(&mut self, config: &CameraConfig) -> AnyResult<()> {
         let name = config.name.clone();
-        log::trace!("Attempting connection with config: {config:?}");
+        log::debug!("{}: Attempting connection", name);
+        let connect_start = std::time::Instant::now();
         let camera = Arc::new(connect_and_login(config).await?);
-        log::trace!("  - Connected");
+        let connect_elapsed = connect_start.elapsed();
+        log::info!("{}: Connected to camera in {:.1}s", name, connect_elapsed.as_secs_f64());
 
         sleep(CAMERA_WAKEUP_DELAY).await;
         if let Err(e) = update_camera_time(&camera, &name, config.update_time).await {
-            log::warn!("Could not set camera time, (perhaps missing on this camera of your login in not an admin): {e:?}");
+            log::warn!("{}: Could not set camera time (perhaps your login is not an admin): {e:?}", name);
         }
         sleep(CAMERA_WAKEUP_DELAY).await;
 
