@@ -1,4 +1,3 @@
-use gstreamer::ClockTime;
 use std::{collections::HashMap, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
@@ -277,6 +276,7 @@ pub(super) async fn make_factory(
                             .name(thread_name)
                             .spawn(move || {
                                 let mut vid_ts: u64 = 0;
+                                let mut vid_camera_ts: Option<u32> = None;
                                 let mut aud_ts: u64 = 0;
                                 let mut pools = Default::default();
 
@@ -288,6 +288,7 @@ pub(super) async fn make_factory(
                                         &vid_src,
                                         &aud_src,
                                         &mut vid_ts,
+                                        &mut vid_camera_ts,
                                         &mut aud_ts,
                                         &stream_config_clone,
                                     );
@@ -304,6 +305,7 @@ pub(super) async fn make_factory(
                                         &vid_src,
                                         &aud_src,
                                         &mut vid_ts,
+                                        &mut vid_camera_ts,
                                         &mut aud_ts,
                                         &stream_config_clone,
                                     );
@@ -346,6 +348,7 @@ fn send_to_sources(
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
     vid_ts: &mut u64,
+    vid_camera_ts: &mut Option<u32>,
     aud_ts: &mut u64,
     _stream_config: &StreamConfig,
 ) -> AnyResult<()> {
@@ -368,12 +371,7 @@ fn send_to_sources(
         }
         BcMedia::Iframe(BcMediaIframe { data, microseconds, .. })
         | BcMedia::Pframe(BcMediaPframe { data, microseconds, .. }) => {
-            let last_camera_ts = *vid_ts >> 32; 
-            let mut current_ts = *vid_ts & 0xFFFFFFFF;
-            
-            if last_camera_ts == 0 && current_ts == 0 {
-                *vid_ts = (microseconds as u64) << 32; 
-            } else {
+            if let Some(last_camera_ts) = *vid_camera_ts {
                 let mut diff = microseconds as i64 - last_camera_ts as i64;
                 if diff < -2_000_000_000 {
                     diff += 0x1_0000_0000;
@@ -382,17 +380,18 @@ fn send_to_sources(
                 }
                 
                 if diff.abs() > 5_000_000 {
-                    current_ts += 66666; 
+                    *vid_ts += 66666; 
                 } else {
-                    current_ts = (current_ts as i64 + diff).max(0) as u64;
+                    *vid_ts = (*vid_ts as i64 + diff).max(0) as u64;
                 }
-                
-                *vid_ts = ((microseconds as u64) << 32) | (current_ts & 0xFFFFFFFF);
+            } else {
+                *vid_ts = 0;
             }
             
+            *vid_camera_ts = Some(microseconds);
+            
             if let Some(vid_src) = vid_src.as_ref() {
-                let actual_ts = *vid_ts & 0xFFFFFFFF;
-                send_to_appsrc(vid_src, data, Duration::from_micros(actual_ts), pools)?;
+                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?;
             }
         }
         _ => {}
@@ -481,19 +480,6 @@ fn send_to_appsrc(
         Err(e) => Err(anyhow::anyhow!("Error in streaming: {e:?}")),
     }?;
     
-    if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Paused)
-    {
-        if let Err(e) = appsrc.set_state(gstreamer::State::Playing) {
-            log::error!("Failed to set appsrc to Playing: {e:?}");
-        }
-    } else if appsrc.current_level_bytes() <= appsrc.max_bytes() / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Playing)
-    {
-        if let Err(e) = appsrc.set_state(gstreamer::State::Paused) {
-            log::error!("Failed to set appsrc to Paused: {e:?}");
-        }
-    }
     Ok(())
 }
 fn check_live(app: &AppSrc) -> Result<()> {
