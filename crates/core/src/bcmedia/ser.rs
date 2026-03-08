@@ -70,6 +70,7 @@ impl BcMedia {
                     buf,
                 )?
             }
+            BcMedia::Skip => (buf, 0),
         };
 
         Ok(buf)

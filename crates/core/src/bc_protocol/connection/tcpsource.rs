@@ -3,7 +3,7 @@ use crate::Result;
 use crate::{bc::codex::BcCodex, Credentials};
 use delegate::delegate;
 use futures::{sink::Sink, stream::Stream};
-use log::{trace, warn};
+use log::trace;
 use socket2::{SockRef, TcpKeepalive};
 use std::net::SocketAddr;
 use std::pin::Pin;

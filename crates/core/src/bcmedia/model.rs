@@ -13,9 +13,13 @@ pub enum BcMedia {
     Aac(BcMediaAac),
     /// Holds ADPCM audio
     Adpcm(BcMediaAdpcm),
+    /// Internal variant to skip markers/NULLs
+    Skip,
 }
 //
 pub(super) const MAGIC_HEADER_BCMEDIA_INFO_V1: u32 = 0x31303031;
+pub(super) const MAGIC_HEADER_BCMEDIA_NULL: u32 = 0x00000000;
+pub(super) const MAGIC_HEADER_BCMEDIA_INFO_ALT: u32 = 0x30303030;
 
 /// The start of a BcMedia stream contains this message
 /// which describes the data to follow
@@ -250,6 +254,9 @@ impl BcMediaAac {
 }
 
 pub(super) const MAGIC_HEADER_BCMEDIA_ADPCM: u32 = 0x62773130;
+
+pub(super) const MAGIC_MARKER_REOLINK: u32 = 0x6c6f6572; // 'reol'
+pub(super) const MAGIC_MARKER_BAICHUAN: u32 = 0x63696162; // 'baic'
 
 pub(super) const MAGIC_HEADER_BCMEDIA_ADPCM_DATA: u16 = 0x0100;
 

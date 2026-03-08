@@ -2,6 +2,7 @@ use super::model::*;
 use crate::Error;
 use bytes::{Buf, BytesMut};
 use nom::{bytes::streaming::take, combinator::*, error::context, number::streaming::*};
+use std::convert::TryInto;
 
 type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
 
@@ -20,54 +21,67 @@ impl BcMedia {
 }
 
 fn bcmedia(buf: &[u8]) -> IResult<&[u8], BcMedia> {
+    let original_buf = buf;
     let (buf, magic) = context(
         "Failed to match any known bcmedia",
         verify(le_u32, |x| {
-            matches!(
-                *x,
-                MAGIC_HEADER_BCMEDIA_INFO_V1
-                    | MAGIC_HEADER_BCMEDIA_INFO_V2
-                    | MAGIC_HEADER_BCMEDIA_IFRAME..=MAGIC_HEADER_BCMEDIA_IFRAME_LAST
-                    | MAGIC_HEADER_BCMEDIA_PFRAME..=MAGIC_HEADER_BCMEDIA_PFRAME_LAST
-                    | MAGIC_HEADER_BCMEDIA_AAC
-                    | MAGIC_HEADER_BCMEDIA_ADPCM
-            )
+            (*x == MAGIC_HEADER_BCMEDIA_INFO_V1)
+                || (*x == MAGIC_HEADER_BCMEDIA_INFO_V2)
+                || ((*x & 0x00FFFFFF) == 0x00306463) // cd0x style
+                || ((*x & 0x00FFFFFF) == 0x00316463) // cd1x style
+                || ((*x & 0xFFFFFF00) == 0x63643000) // 00dc style
+                || ((*x & 0xFFFFFF00) == 0x63643100) // 01dc style
+                || (*x == MAGIC_HEADER_BCMEDIA_AAC)
+                || (*x == MAGIC_HEADER_BCMEDIA_ADPCM)
+                || (*x == MAGIC_MARKER_REOLINK)
+                || (*x == MAGIC_MARKER_BAICHUAN)
+                || (*x == MAGIC_HEADER_BCMEDIA_NULL)
+                || (*x == MAGIC_HEADER_BCMEDIA_INFO_ALT)
         }),
-    )(buf)?;
+    )(buf).map_err(|e| {
+        if original_buf.len() >= 4 {
+            let le = u32::from_le_bytes(original_buf[0..4].try_into().unwrap());
+            let be = u32::from_be_bytes(original_buf[0..4].try_into().unwrap());
+            log::debug!("Invalid Magic at start: LE:{:08x} BE:{:08x} (next 28 bytes: {:02x?})", le, be, &original_buf[4..original_buf.len().min(32)]);
+        }
+        e
+    })?;
 
-    match magic {
-        MAGIC_HEADER_BCMEDIA_INFO_V1 => {
-            let (buf, payload) = bcmedia_info_v1(buf)?;
-            Ok((buf, BcMedia::InfoV1(payload)))
-        }
-        MAGIC_HEADER_BCMEDIA_INFO_V2 => {
-            let (buf, payload) = bcmedia_info_v2(buf)?;
-            Ok((buf, BcMedia::InfoV2(payload)))
-        }
-        MAGIC_HEADER_BCMEDIA_IFRAME..=MAGIC_HEADER_BCMEDIA_IFRAME_LAST => {
-            let (buf, payload) = bcmedia_iframe(buf)?;
-            Ok((buf, BcMedia::Iframe(payload)))
-        }
-        MAGIC_HEADER_BCMEDIA_PFRAME..=MAGIC_HEADER_BCMEDIA_PFRAME_LAST => {
-            let (buf, payload) = bcmedia_pframe(buf)?;
-            Ok((buf, BcMedia::Pframe(payload)))
-        }
-        MAGIC_HEADER_BCMEDIA_AAC => {
-            let (buf, payload) = bcmedia_aac(buf)?;
-            Ok((buf, BcMedia::Aac(payload)))
-        }
-        MAGIC_HEADER_BCMEDIA_ADPCM => {
-            let (buf, payload) = bcmedia_adpcm(buf)?;
-            Ok((buf, BcMedia::Adpcm(payload)))
-        }
-        _ => unreachable!(),
+    if magic == MAGIC_HEADER_BCMEDIA_INFO_V1 {
+        let (buf, payload) = bcmedia_info_v1(buf)?;
+        Ok((buf, BcMedia::InfoV1(payload)))
+    } else if magic == MAGIC_HEADER_BCMEDIA_INFO_V2 {
+        let (buf, payload) = bcmedia_info_v2(buf)?;
+        Ok((buf, BcMedia::InfoV2(payload)))
+    } else if (magic & 0x00FFFFFF) == 0x00306463 || (magic & 0xFFFFFF00) == 0x63643000 {
+        let (buf, payload) = bcmedia_iframe(buf)?;
+        Ok((buf, BcMedia::Iframe(payload)))
+    } else if (magic & 0x00FFFFFF) == 0x00316463 || (magic & 0xFFFFFF00) == 0x63643100 {
+        let (buf, payload) = bcmedia_pframe(buf)?;
+        Ok((buf, BcMedia::Pframe(payload)))
+    } else if magic == MAGIC_HEADER_BCMEDIA_AAC {
+        let (buf, payload) = bcmedia_aac(buf)?;
+        Ok((buf, BcMedia::Aac(payload)))
+    } else if magic == MAGIC_HEADER_BCMEDIA_ADPCM {
+        let (buf, payload) = bcmedia_adpcm(buf)?;
+        Ok((buf, BcMedia::Adpcm(payload)))
+    } else if magic == MAGIC_MARKER_REOLINK || magic == MAGIC_MARKER_BAICHUAN {
+        let (buf, _) = take(12usize)(buf)?;
+        Ok((buf, BcMedia::Skip))
+    } else if magic == MAGIC_HEADER_BCMEDIA_INFO_ALT {
+        let (buf, _) = take(28usize)(buf)?;
+        Ok((buf, BcMedia::Skip))
+    } else if magic == MAGIC_HEADER_BCMEDIA_NULL {
+        Ok((buf, BcMedia::Skip))
+    } else {
+        unreachable!()
     }
 }
 
 fn bcmedia_info_v1(buf: &[u8]) -> IResult<&[u8], BcMediaInfoV1> {
     let (buf, _header_size) = context(
         "Header size mismatch in BCMedia InfoV1",
-        verify(le_u32, |x| *x == 32),
+        verify(le_u32, |x| *x == 32 || *x == 20),
     )(buf)?;
     let (buf, video_width) = le_u32(buf)?;
     let (buf, video_height) = le_u32(buf)?;
@@ -113,7 +127,7 @@ fn bcmedia_info_v1(buf: &[u8]) -> IResult<&[u8], BcMediaInfoV1> {
 fn bcmedia_info_v2(buf: &[u8]) -> IResult<&[u8], BcMediaInfoV2> {
     let (buf, _header_size) = context(
         "Failed to match headersize in BCMedia Info V2",
-        verify(le_u32, |x| *x == 32),
+        verify(le_u32, |x| *x == 32 || *x == 20),
     )(buf)?;
     let (buf, video_width) = le_u32(buf)?;
     let (buf, video_height) = le_u32(buf)?;
