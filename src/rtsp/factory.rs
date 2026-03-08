@@ -175,38 +175,46 @@ pub(super) async fn make_factory(
     let thread = tokio::task::spawn(async move {
         let name = camera.config().await?.borrow().name.clone();
 
-        while let Some(msg) = client_rx.recv().await {
-            match msg {
-                ClientMsg::NewClient { element, reply } => {
-                    log::info!("New RTSP client for {name}::{stream}");
-                    let camera = camera.clone();
-                    let name = name.clone();
-                    tokio::task::spawn(async move {
-                        clear_bin(&element)?;
-                        log::trace!("{name}::{stream}: Starting camera");
+        log::info!("{name}::{stream}: Starting camera stream immediately");
+        let mut media_rx = camera.stream_while_live(stream).await?;
 
-                        // Start the camera
-                        let config = camera.config().await?.borrow().clone();
-                        let mut media_rx = camera.stream_while_live(stream).await?;
+        log::trace!("{name}::{stream}: Learning camera stream type");
+        let mut buffer = vec![];
+        let mut stream_config = StreamConfig::new(&camera, stream).await?;
+        let mut active_sender: Option<tokio::sync::mpsc::Sender<BcMedia>> = None;
 
-                        log::trace!("{name}::{stream}: Learning camera stream type");
-                        // Learn the camera data type
-                        let mut buffer = vec![];
-                        let mut frame_count = 0usize;
-
-                        let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
-                            stream_config.update_from_media(&media);
-                            buffer.push(media);
-                            if frame_count > 500
-                                || (stream_config.vid_type.is_some()
-                                    && stream_config.aud_type.is_some())
-
-                            {
-                                break;
+        loop {
+            tokio::select! {
+                media_opt = media_rx.recv() => {
+                    if let Some(mut media) = media_opt {
+                        stream_config.update_from_media(&media);
+                        
+                        if let Some(sender) = active_sender.as_ref() {
+                            if let Err(tokio::sync::mpsc::error::SendError(returned_media)) = sender.send(media).await {
+                                log::info!("Client sender disconnected for {name}::{stream}");
+                                active_sender = None;
+                                media = returned_media;
+                            } else {
+                                continue;
                             }
-                            frame_count += 1;
                         }
+                        
+                        if matches!(media, BcMedia::Iframe(_)) {
+                            buffer.clear();
+                        }
+                        buffer.push(media);
+                        if buffer.len() > 1000 {
+                            let _ = buffer.drain(0..500);
+                        }
+                    } else {
+                        log::info!("{name}::{stream}: Camera stream ended");
+                        break;
+                    }
+                }
+                msg_opt = client_rx.recv() => {
+                    if let Some(ClientMsg::NewClient { element, reply }) = msg_opt {
+                        log::info!("New RTSP client for {name}::{stream}");
+                        clear_bin(&element)?;
 
                         log::trace!("{name}::{stream}: Building the pipeline");
                         // Build the right video pipeline
@@ -220,6 +228,7 @@ pub(super) async fn make_factory(
                                 AnyResult::Ok(Some(src))
                             }
                             None => {
+                                let config = camera.config().await?.borrow().clone();
                                 build_unknown(&element, &config.splash_pattern.to_string())?;
                                 AnyResult::Ok(None)
                             }
@@ -254,51 +263,27 @@ pub(super) async fn make_factory(
                         }
 
                         log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
-                        // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
-                        // Run blocking code on a separate named thread.
-                        // This is not an async thread — it sends frames into GStreamer.
+                        let (tx, mut rx) = tokio::sync::mpsc::channel(500);
+                        active_sender = Some(tx);
+
+                        let mut to_send = buffer.clone();
+                        buffer.clear();
+
                         let thread_name = format!("{name}::{stream}::sender");
+                        let stream_config_clone = stream_config.clone();
                         std::thread::Builder::new()
-                            .name(thread_name.clone())
+                            .name(thread_name)
                             .spawn(move || {
-                                // Drain the channel to get the most recent frames
-                                while let Ok(media) = media_rx.try_recv() {
-                                    buffer.push(media);
-                                }
-
-                                // We only want the most recent IFrame and everything after it.
-                                // This prevents dumping 50 seconds of old video into a live pipeline,
-                                // which causes GStreamer to block the queue and drop the IFrame.
-                                let mut last_iframe_idx = None;
-                                for (i, media) in buffer.iter().enumerate() {
-                                    if matches!(media, BcMedia::Iframe(_)) {
-                                        last_iframe_idx = Some(i);
-                                    }
-                                }
-
-                                let mut to_send = if let Some(idx) = last_iframe_idx {
-                                    buffer.split_off(idx)
-                                } else {
-                                    // If no IFrame found, just use the whole buffer (or keep it small)
-                                    if buffer.len() > 10 {
-                                        buffer.split_off(buffer.len() - 10)
-                                    } else {
-                                        buffer
-                                    }
-                                };
-
-                                // Use u64 for timestamps to avoid overflow
-                                // u32 overflows after ~71 minutes at 30fps
-                                let mut aud_ts: u64 = 0;
                                 let mut vid_ts: u64 = 0;
+                                let mut aud_ts: u64 = 0;
                                 let mut base_rt: Option<Duration> = None;
                                 let mut pools = Default::default();
 
-                                log::trace!("{name}::{stream}: Sending buffered frames");
+                                log::trace!("Sending buffered frames");
                                 for buffered in to_send.drain(..) {
-                                    send_to_sources(
+                                    let r = send_to_sources(
                                         buffered,
                                         &mut pools,
                                         &vid_src,
@@ -306,12 +291,15 @@ pub(super) async fn make_factory(
                                         &mut vid_ts,
                                         &mut aud_ts,
                                         &mut base_rt,
-                                        &stream_config,
-                                    )?;
+                                        &stream_config_clone,
+                                    );
+                                    if let Err(r) = r {
+                                        log::info!("Failed to send to source: {r:?}");
+                                    }
                                 }
 
-                                log::trace!("{name}::{stream}: Sending new frames");
-                                while let Some(data) = media_rx.blocking_recv() {
+                                log::trace!("Sending new frames");
+                                while let Some(data) = rx.blocking_recv() {
                                     let r = send_to_sources(
                                         data,
                                         &mut pools,
@@ -320,23 +308,23 @@ pub(super) async fn make_factory(
                                         &mut vid_ts,
                                         &mut aud_ts,
                                         &mut base_rt,
-                                        &stream_config,
+                                        &stream_config_clone,
                                     );
                                     if let Err(r) = &r {
                                         log::info!("Failed to send to source: {r:?}");
+                                        break;
                                     }
-                                    r?;
                                 }
                                 log::trace!("All media received");
                                 AnyResult::Ok(())
                             })
                             .unwrap_or_else(|e| {
                                 log::error!("Failed to spawn frame sender thread: {e}");
-                                // Return a dummy handle that does nothing
                                 std::thread::spawn(|| AnyResult::Ok(()))
                             });
-                        AnyResult::Ok(())
-                    });
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -363,7 +351,7 @@ fn send_to_sources(
     vid_ts: &mut u64,
     aud_ts: &mut u64,
     base_rt: &mut Option<Duration>,
-    stream_config: &StreamConfig,
+    _stream_config: &StreamConfig,
 ) -> AnyResult<()> {
     // Update timestamps (u64 to avoid overflow during long streams)
     match data {
