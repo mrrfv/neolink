@@ -276,6 +276,8 @@ pub(super) async fn make_factory(
                         std::thread::Builder::new()
                             .name(thread_name)
                             .spawn(move || {
+                                let mut vid_ts: u64 = 0;
+                                let mut aud_ts: u64 = 0;
                                 let mut pools = Default::default();
 
                                 log::trace!("Sending buffered frames");
@@ -285,6 +287,8 @@ pub(super) async fn make_factory(
                                         &mut pools,
                                         &vid_src,
                                         &aud_src,
+                                        &mut vid_ts,
+                                        &mut aud_ts,
                                         &stream_config_clone,
                                     );
                                     if let Err(r) = r {
@@ -299,6 +303,8 @@ pub(super) async fn make_factory(
                                         &mut pools,
                                         &vid_src,
                                         &aud_src,
+                                        &mut vid_ts,
+                                        &mut aud_ts,
                                         &stream_config_clone,
                                     );
                                     if let Err(r) = &r {
@@ -339,23 +345,54 @@ fn send_to_sources(
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
+    vid_ts: &mut u64,
+    aud_ts: &mut u64,
     _stream_config: &StreamConfig,
 ) -> AnyResult<()> {
     match data {
         BcMedia::Aac(aac) => {
-            if let Some(aud_src) = aud_src.as_ref() {
-                send_to_appsrc(aud_src, aac.data, pools)?;
+            if let Some(duration) = aac.duration() {
+                if let Some(aud_src) = aud_src.as_ref() {
+                    send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts), pools)?;
+                }
+                *aud_ts += duration as u64;
             }
         }
         BcMedia::Adpcm(adpcm) => {
-            if let Some(aud_src) = aud_src.as_ref() {
-                send_to_appsrc(aud_src, adpcm.data, pools)?;
+            if let Some(duration) = adpcm.duration() {
+                if let Some(aud_src) = aud_src.as_ref() {
+                    send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts), pools)?;
+                }
+                *aud_ts += duration as u64;
             }
         }
-        BcMedia::Iframe(BcMediaIframe { data, .. })
-        | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
+        BcMedia::Iframe(BcMediaIframe { data, microseconds, .. })
+        | BcMedia::Pframe(BcMediaPframe { data, microseconds, .. }) => {
+            let last_camera_ts = *vid_ts >> 32; 
+            let mut current_ts = *vid_ts & 0xFFFFFFFF;
+            
+            if last_camera_ts == 0 && current_ts == 0 {
+                *vid_ts = (microseconds as u64) << 32; 
+            } else {
+                let mut diff = microseconds as i64 - last_camera_ts as i64;
+                if diff < -2_000_000_000 {
+                    diff += 0x1_0000_0000;
+                } else if diff > 2_000_000_000 {
+                    diff -= 0x1_0000_0000;
+                }
+                
+                if diff.abs() > 5_000_000 {
+                    current_ts += 66666; 
+                } else {
+                    current_ts = (current_ts as i64 + diff).max(0) as u64;
+                }
+                
+                *vid_ts = ((microseconds as u64) << 32) | (current_ts & 0xFFFFFFFF);
+            }
+            
             if let Some(vid_src) = vid_src.as_ref() {
-                send_to_appsrc(vid_src, data, pools)?;
+                let actual_ts = *vid_ts & 0xFFFFFFFF;
+                send_to_appsrc(vid_src, data, Duration::from_micros(actual_ts), pools)?;
             }
         }
         _ => {}
@@ -366,6 +403,7 @@ fn send_to_sources(
 fn send_to_appsrc(
     appsrc: &AppSrc,
     data: Vec<u8>,
+    ts: Duration,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
 ) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
@@ -423,6 +461,11 @@ fn send_to_appsrc(
         let gst_buf_mut = new_buf
             .get_mut()
             .ok_or_else(|| anyhow::anyhow!("Failed to get mutable buffer reference"))?;
+            
+        let time = gstreamer::ClockTime::from_useconds(ts.as_micros() as u64);
+        gst_buf_mut.set_dts(time);
+        gst_buf_mut.set_pts(time);
+        
         let mut gst_buf_data = gst_buf_mut
             .map_writable()
             .map_err(|e| anyhow::anyhow!("Failed to map buffer writable: {e:?}"))?;
@@ -530,7 +573,7 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(true);
+    source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
 
@@ -582,7 +625,7 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(true);
+    source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
 
@@ -635,7 +678,7 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(true);
+    source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
 
@@ -722,7 +765,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(true);
+    source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
 
@@ -796,7 +839,7 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(true);
+    source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
 
