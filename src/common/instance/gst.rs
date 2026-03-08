@@ -193,8 +193,15 @@ impl NeoInstance {
                         Box::pin(async move {
                             let mut media_stream = cam.start_video(stream, 0, strict).await?;
                             log::trace!("Camera started");
-                            while let Ok(media) = media_stream.get_data().await? {
-                                media_tx.send(media).await?;
+                            while let Ok(res) = media_stream.get_data().await {
+                                match res {
+                                    Ok(media) => {
+                                        media_tx.send(media).await?;
+                                    }
+                                    Err(e) => {
+                                        log::debug!("Recovered from stream error: {:?}", e);
+                                    }
+                                }
                             }
                             AnyResult::Ok(())
                         })
