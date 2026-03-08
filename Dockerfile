@@ -22,14 +22,7 @@ COPY . /usr/local/src/neolink
 # so if it is failing please make a PR
 #
 # hadolint ignore=DL3008
-RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
-  if [ -f "${TARGETPLATFORM}/neolink" ]; then \
-    echo "Restoring from artifact"; \
-    mkdir -p /usr/local/src/neolink/target/release/; \
-    cp "${TARGETPLATFORM}/neolink" "/usr/local/src/neolink/target/release/neolink"; \
-  else \
-    echo "Building from scratch"; \
-    apt-get update && \
+RUN apt-get update && \
         apt-get upgrade -y && \
         apt-get install -y --no-install-recommends \
           build-essential \
@@ -42,8 +35,7 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
           protobuf-compiler \
           libglib2.0-dev && \
         apt-get clean -y && rm -rf /var/lib/apt/lists/* ; \
-    cargo build --release; \
-  fi
+    cargo build --release
 
 # Create the release container. Match the base OS used to build
 FROM debian:bookworm-slim
