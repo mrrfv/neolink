@@ -276,9 +276,6 @@ pub(super) async fn make_factory(
                         std::thread::Builder::new()
                             .name(thread_name)
                             .spawn(move || {
-                                let mut vid_ts: u64 = 0;
-                                let mut aud_ts: u64 = 0;
-                                let mut base_rt: Option<Duration> = None;
                                 let mut pools = Default::default();
 
                                 log::trace!("Sending buffered frames");
@@ -288,9 +285,6 @@ pub(super) async fn make_factory(
                                         &mut pools,
                                         &vid_src,
                                         &aud_src,
-                                        &mut vid_ts,
-                                        &mut aud_ts,
-                                        &mut base_rt,
                                         &stream_config_clone,
                                     );
                                     if let Err(r) = r {
@@ -305,9 +299,6 @@ pub(super) async fn make_factory(
                                         &mut pools,
                                         &vid_src,
                                         &aud_src,
-                                        &mut vid_ts,
-                                        &mut aud_ts,
-                                        &mut base_rt,
                                         &stream_config_clone,
                                     );
                                     if let Err(r) = &r {
@@ -348,68 +339,23 @@ fn send_to_sources(
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u64,
-    aud_ts: &mut u64,
-    base_rt: &mut Option<Duration>,
     _stream_config: &StreamConfig,
 ) -> AnyResult<()> {
-    // Update timestamps (u64 to avoid overflow during long streams)
     match data {
         BcMedia::Aac(aac) => {
-            if let Some(duration) = aac.duration() {
-                if let Some(aud_src) = aud_src.as_ref() {
-                    log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
-                    send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts), base_rt, pools)?;
-                }
-                *aud_ts += duration as u64;
-            } else {
-                log::warn!("Skipping AAC frame: could not calculate duration");
+            if let Some(aud_src) = aud_src.as_ref() {
+                send_to_appsrc(aud_src, aac.data, pools)?;
             }
         }
         BcMedia::Adpcm(adpcm) => {
-            if let Some(duration) = adpcm.duration() {
-                if let Some(aud_src) = aud_src.as_ref() {
-                    log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
-                    send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts), base_rt, pools)?;
-                }
-                *aud_ts += duration as u64;
-            } else {
-                log::warn!("Skipping ADPCM frame: could not calculate duration");
+            if let Some(aud_src) = aud_src.as_ref() {
+                send_to_appsrc(aud_src, adpcm.data, pools)?;
             }
         }
-        BcMedia::Iframe(BcMediaIframe { data, microseconds, .. })
-        | BcMedia::Pframe(BcMediaPframe { data, microseconds, .. }) => {
-            // Camera's microseconds wrap around every 71 minutes (u32 max).
-            // We need to unwrap it into a monotonically increasing u64, starting at 0.
-            let last_camera_ts = *vid_ts >> 32; // We can pack the last camera ts in the upper 32 bits
-            let mut current_ts = *vid_ts & 0xFFFFFFFF;
-            
-            if last_camera_ts == 0 && current_ts == 0 {
-                // Very first frame
-                *vid_ts = (microseconds as u64) << 32; // Start our internal ts at 0, store camera ts
-            } else {
-                let mut diff = microseconds as i64 - last_camera_ts as i64;
-                if diff < -2_000_000_000 {
-                    // Wrapper around
-                    diff += 0x1_0000_0000;
-                } else if diff > 2_000_000_000 {
-                    diff -= 0x1_0000_0000;
-                }
-                
-                if diff.abs() > 5_000_000 {
-                    // Massive jump, just step by 1/15th of a second
-                    current_ts += 66666; 
-                } else {
-                    current_ts = (current_ts as i64 + diff).max(0) as u64;
-                }
-                
-                *vid_ts = ((microseconds as u64) << 32) | (current_ts & 0xFFFFFFFF);
-            }
-            
+        BcMedia::Iframe(BcMediaIframe { data, .. })
+        | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
-                let actual_ts = *vid_ts & 0xFFFFFFFF;
-                log::debug!("Sending VID: {:?}", Duration::from_micros(actual_ts));
-                send_to_appsrc(vid_src, data, Duration::from_micros(actual_ts), base_rt, pools)?;
+                send_to_appsrc(vid_src, data, pools)?;
             }
         }
         _ => {}
@@ -420,53 +366,10 @@ fn send_to_sources(
 fn send_to_appsrc(
     appsrc: &AppSrc,
     data: Vec<u8>,
-    mut ts: Duration,
-    base_rt: &mut Option<Duration>,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
 ) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
-    // In live mode we must timestamp buffers against the running time of the pipeline.
-    // If we don't, GStreamer will drop them for being "late" or queue them indefinitely.
-    if appsrc.is_live() {
-        if let Some(time) = appsrc
-            .current_clock_time()
-            .and_then(|t| appsrc.base_time().map(|bt| t - bt))
-        {
-            if matches!(appsrc.current_state(), gstreamer::State::Playing) {
-                // First frame pushed while Playing sets the offset between our local 0-based
-                // vid_ts/aud_ts and the pipeline's running time.
-                let running_time = Duration::from_micros(time.useconds());
-                
-                let brt = *base_rt.get_or_insert_with(|| {
-                    if running_time > ts {
-                        running_time - ts
-                    } else {
-                        Duration::from_micros(0)
-                    }
-                });
-                
-                ts += brt;
-            } else {
-                // Not playing yet, don't push to avoid blocking/dropping
-                return Ok(());
-            }
-        } else {
-            // Clock not up yet
-            return Ok(());
-        }
-    }
-    // This gives slow clients a chance to catch up without excessive delays.
-    //
-    // Architecture note: Each RTSP client has their own thread and buffer,
-    // so backpressure on one client does NOT affect other clients.
-    //
-    // Strategy:
-    // - Check buffer level before pushing
-    // - If > 90% full, wait with exponential backoff
-    // - Max 3 retries (~70ms total wait) - reduced from 5 retries (~310ms)
-    //   to minimize latency impact for time-sensitive applications like ALPR
-    // - If still full after retries, push anyway (GStreamer will handle overflow)
     const MAX_RETRIES: u32 = 3;
     const INITIAL_WAIT_MS: u64 = 5;
     const BUFFER_THRESHOLD: u64 = 90; // Percent
@@ -479,68 +382,30 @@ fn send_to_appsrc(
 
     while appsrc.current_level_bytes() >= threshold_bytes && retries < MAX_RETRIES {
         retries += 1;
-        log::trace!(
-            "Buffer {:.0}% full on {}, waiting {}ms (retry {}/{})",
-            (appsrc.current_level_bytes() as f64 / max_bytes as f64) * 100.0,
-            appsrc.name(),
-            wait_ms,
-            retries,
-            MAX_RETRIES
-        );
         std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-        wait_ms *= 2; // Exponential backoff: 10, 20, 40ms = 70ms max
+        wait_ms *= 2; 
     }
 
     if retries >= MAX_RETRIES {
         let is_audio = appsrc.name().as_str().contains("aud");
-        let fill_pct = (appsrc.current_level_bytes() as f64 / max_bytes as f64) * 100.0;
-
         if is_audio {
-            // Drop audio frames when buffer is full to prevent pipeline collapse.
-            // Audio drops are far less noticeable than the alternative: the buffer
-            // overflows, causing TCP congestion → pipeline flushing → EOF → full
-            // stream reconnection cycle visible to the user.
-            log::debug!(
-                "Dropping audio frame on {} (buffer {:.0}% full) to prevent pipeline collapse",
-                appsrc.name(),
-                fill_pct,
-            );
             return Ok(());
         }
-
-        // For video: log warning but continue pushing (video is critical)
-        log::warn!(
-            "Client {} buffer {:.0}% full after {}ms backpressure, frame may be delayed",
-            appsrc.name(),
-            fill_pct,
-            10 + 20 + 40 // Total backpressure wait
-        );
     }
 
     let msg_size = data.len();
 
-    // Evict oldest pools if we're at capacity (prevents memory leak)
-    // Remove the smallest pool first - video frames are larger and more important
     while pools.len() >= MAX_BUFFER_POOLS && !pools.contains_key(&msg_size) {
         if let Some(&smallest_key) = pools.keys().min() {
             if let Some(old_pool) = pools.remove(&smallest_key) {
-                log::debug!(
-                    "Evicting buffer pool for size {} (have {} pools, max {})",
-                    smallest_key,
-                    pools.len() + 1,
-                    MAX_BUFFER_POOLS
-                );
                 let _ = old_pool.set_active(false);
             }
         }
     }
 
-    // Get or create a pool of this len
     let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-        log::trace!("Creating buffer pool for frame size {} bytes", size);
         let pool = gstreamer::BufferPool::new();
         let mut pool_config = pool.config();
-        // Set a max buffers to ensure we don't grow in memory endlessly
         pool_config.set_params(None, (*size) as u32, 8, 32);
         if let Err(e) = pool.set_config(pool_config) {
             log::error!("Failed to configure buffer pool: {}", e);
@@ -551,44 +416,28 @@ fn send_to_appsrc(
         pool
     });
 
-    // Get a buffer from the pool and then copy in the data
     let buf = {
         let mut new_buf = pool
             .acquire_buffer(None)
-            .map_err(|e| anyhow!("Failed to acquire buffer from pool: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to acquire buffer from pool: {e:?}"))?;
         let gst_buf_mut = new_buf
             .get_mut()
-            .ok_or_else(|| anyhow!("Failed to get mutable buffer reference"))?;
-        let time = ClockTime::from_useconds(ts.as_micros() as u64);
-        gst_buf_mut.set_dts(time);
-        gst_buf_mut.set_pts(time);
+            .ok_or_else(|| anyhow::anyhow!("Failed to get mutable buffer reference"))?;
         let mut gst_buf_data = gst_buf_mut
             .map_writable()
-            .map_err(|e| anyhow!("Failed to map buffer writable: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to map buffer writable: {e:?}"))?;
         gst_buf_data.copy_from_slice(data.as_slice());
         drop(gst_buf_data);
         new_buf
     };
 
-    // Push buffer into the appsrc
     match appsrc.push_buffer(buf) {
         Ok(_) => Ok(()),
-        Err(FlowError::Flushing) => {
-            // Pipeline is flushing or client disconnected
-            log::debug!(
-                "Pipeline flushing on {}, client may have disconnected",
-                appsrc.name()
-            );
-            Ok(())
-        }
-        Err(FlowError::Eos) => {
-            // End of stream - normal shutdown
-            log::debug!("EOS on {}", appsrc.name());
-            Ok(())
-        }
-        Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
+        Err(FlowError::Flushing) => Ok(()),
+        Err(FlowError::Eos) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("Error in streaming: {e:?}")),
     }?;
-    // Check if we need to pause
+    
     if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
         && matches!(appsrc.current_state(), gstreamer::State::Paused)
     {
@@ -676,12 +525,13 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(true);
     source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(true);
+    source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
@@ -727,12 +577,13 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     let source = make_element("appsrc", "vidsrc")?
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
+    source.set_is_live(true);
     source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(true);
+    source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
@@ -779,12 +630,13 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(true);
     source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(true);
+    source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
@@ -865,12 +717,13 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     let source = make_element("appsrc", "audsrc")?
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
+    source.set_is_live(true);
     source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(true);
+    source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
 
     source.set_caps(Some(
@@ -938,12 +791,13 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(true);
     source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(true);
+    source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
