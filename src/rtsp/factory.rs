@@ -27,7 +27,7 @@ const AUDIO_BUFFER_SIZE: u32 = 512 * 1416;
 /// a few common sizes (I-frames ~50-100KB, P-frames ~5-20KB), so 32 pools
 /// should be more than sufficient. This prevents memory leaks from cameras
 /// with highly variable frame sizes.
-const MAX_BUFFER_POOLS: usize = 32;
+const MAX_BUFFER_POOLS: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -138,6 +138,7 @@ impl StreamConfig {
             | BcMedia::Pframe(BcMediaPframe { video_type, .. }) => {
                 self.vid_type = Some(*video_type);
             }
+            BcMedia::Skip => {}
         }
     }
 }
@@ -197,9 +198,10 @@ pub(super) async fn make_factory(
                         while let Some(media) = media_rx.recv().await {
                             stream_config.update_from_media(&media);
                             buffer.push(media);
-                            if frame_count > 10
+                            if frame_count > 500
                                 || (stream_config.vid_type.is_some()
                                     && stream_config.aud_type.is_some())
+
                             {
                                 break;
                             }
@@ -261,14 +263,41 @@ pub(super) async fn make_factory(
                         std::thread::Builder::new()
                             .name(thread_name.clone())
                             .spawn(move || {
+                                // Drain the channel to get the most recent frames
+                                while let Ok(media) = media_rx.try_recv() {
+                                    buffer.push(media);
+                                }
+
+                                // We only want the most recent IFrame and everything after it.
+                                // This prevents dumping 50 seconds of old video into a live pipeline,
+                                // which causes GStreamer to block the queue and drop the IFrame.
+                                let mut last_iframe_idx = None;
+                                for (i, media) in buffer.iter().enumerate() {
+                                    if matches!(media, BcMedia::Iframe(_)) {
+                                        last_iframe_idx = Some(i);
+                                    }
+                                }
+
+                                let mut to_send = if let Some(idx) = last_iframe_idx {
+                                    buffer.split_off(idx)
+                                } else {
+                                    // If no IFrame found, just use the whole buffer (or keep it small)
+                                    if buffer.len() > 10 {
+                                        buffer.split_off(buffer.len() - 10)
+                                    } else {
+                                        buffer
+                                    }
+                                };
+
                                 // Use u64 for timestamps to avoid overflow
                                 // u32 overflows after ~71 minutes at 30fps
                                 let mut aud_ts: u64 = 0;
                                 let mut vid_ts: u64 = 0;
+                                let mut base_rt: Option<Duration> = None;
                                 let mut pools = Default::default();
 
                                 log::trace!("{name}::{stream}: Sending buffered frames");
-                                for buffered in buffer.drain(..) {
+                                for buffered in to_send.drain(..) {
                                     send_to_sources(
                                         buffered,
                                         &mut pools,
@@ -276,6 +305,7 @@ pub(super) async fn make_factory(
                                         &aud_src,
                                         &mut vid_ts,
                                         &mut aud_ts,
+                                        &mut base_rt,
                                         &stream_config,
                                     )?;
                                 }
@@ -289,6 +319,7 @@ pub(super) async fn make_factory(
                                         &aud_src,
                                         &mut vid_ts,
                                         &mut aud_ts,
+                                        &mut base_rt,
                                         &stream_config,
                                     );
                                     if let Err(r) = &r {
@@ -331,6 +362,7 @@ fn send_to_sources(
     aud_src: &Option<AppSrc>,
     vid_ts: &mut u64,
     aud_ts: &mut u64,
+    base_rt: &mut Option<Duration>,
     stream_config: &StreamConfig,
 ) -> AnyResult<()> {
     // Update timestamps (u64 to avoid overflow during long streams)
@@ -339,7 +371,7 @@ fn send_to_sources(
             if let Some(duration) = aac.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
                     log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
-                    send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts), pools)?;
+                    send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts), base_rt, pools)?;
                 }
                 *aud_ts += duration as u64;
             } else {
@@ -350,21 +382,47 @@ fn send_to_sources(
             if let Some(duration) = adpcm.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
                     log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
-                    send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts), pools)?;
+                    send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts), base_rt, pools)?;
                 }
                 *aud_ts += duration as u64;
             } else {
                 log::warn!("Skipping ADPCM frame: could not calculate duration");
             }
         }
-        BcMedia::Iframe(BcMediaIframe { data, .. })
-        | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
-            if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?;
+        BcMedia::Iframe(BcMediaIframe { data, microseconds, .. })
+        | BcMedia::Pframe(BcMediaPframe { data, microseconds, .. }) => {
+            // Camera's microseconds wrap around every 71 minutes (u32 max).
+            // We need to unwrap it into a monotonically increasing u64, starting at 0.
+            let last_camera_ts = *vid_ts >> 32; // We can pack the last camera ts in the upper 32 bits
+            let mut current_ts = *vid_ts & 0xFFFFFFFF;
+            
+            if last_camera_ts == 0 && current_ts == 0 {
+                // Very first frame
+                *vid_ts = (microseconds as u64) << 32; // Start our internal ts at 0, store camera ts
+            } else {
+                let mut diff = microseconds as i64 - last_camera_ts as i64;
+                if diff < -2_000_000_000 {
+                    // Wrapper around
+                    diff += 0x1_0000_0000;
+                } else if diff > 2_000_000_000 {
+                    diff -= 0x1_0000_0000;
+                }
+                
+                if diff.abs() > 5_000_000 {
+                    // Massive jump, just step by 1/15th of a second
+                    current_ts += 66666; 
+                } else {
+                    current_ts = (current_ts as i64 + diff).max(0) as u64;
+                }
+                
+                *vid_ts = ((microseconds as u64) << 32) | (current_ts & 0xFFFFFFFF);
             }
-            const MICROSECONDS: u64 = 1_000_000;
-            *vid_ts += MICROSECONDS / stream_config.fps as u64;
+            
+            if let Some(vid_src) = vid_src.as_ref() {
+                let actual_ts = *vid_ts & 0xFFFFFFFF;
+                log::debug!("Sending VID: {:?}", Duration::from_micros(actual_ts));
+                send_to_appsrc(vid_src, data, Duration::from_micros(actual_ts), base_rt, pools)?;
+            }
         }
         _ => {}
     }
@@ -375,23 +433,34 @@ fn send_to_appsrc(
     appsrc: &AppSrc,
     data: Vec<u8>,
     mut ts: Duration,
+    base_rt: &mut Option<Duration>,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
 ) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
-    // In live mode we follow the advice in
-    // https://gstreamer.freedesktop.org/documentation/additional/design/element-source.html?gi-language=c#live-sources
-    // Only push buffers when in play state and have a clock
-    // we also timestamp at the current time
+    // In live mode we must timestamp buffers against the running time of the pipeline.
+    // If we don't, GStreamer will drop them for being "late" or queue them indefinitely.
     if appsrc.is_live() {
         if let Some(time) = appsrc
             .current_clock_time()
             .and_then(|t| appsrc.base_time().map(|bt| t - bt))
         {
             if matches!(appsrc.current_state(), gstreamer::State::Playing) {
-                ts = Duration::from_micros(time.useconds());
+                // First frame pushed while Playing sets the offset between our local 0-based
+                // vid_ts/aud_ts and the pipeline's running time.
+                let running_time = Duration::from_micros(time.useconds());
+                
+                let brt = *base_rt.get_or_insert_with(|| {
+                    if running_time > ts {
+                        running_time - ts
+                    } else {
+                        Duration::from_micros(0)
+                    }
+                });
+                
+                ts += brt;
             } else {
-                // Not playing
+                // Not playing yet, don't push to avoid blocking/dropping
                 return Ok(());
             }
         } else {
@@ -399,8 +468,6 @@ fn send_to_appsrc(
             return Ok(());
         }
     }
-
-    // Backpressure handling: brief wait if buffer is too full before pushing.
     // This gives slow clients a chance to catch up without excessive delays.
     //
     // Architecture note: Each RTSP client has their own thread and buffer,
@@ -413,7 +480,7 @@ fn send_to_appsrc(
     //   to minimize latency impact for time-sensitive applications like ALPR
     // - If still full after retries, push anyway (GStreamer will handle overflow)
     const MAX_RETRIES: u32 = 3;
-    const INITIAL_WAIT_MS: u64 = 10;
+    const INITIAL_WAIT_MS: u64 = 5;
     const BUFFER_THRESHOLD: u64 = 90; // Percent
 
     let max_bytes = appsrc.max_bytes();
@@ -582,11 +649,7 @@ fn build_unknown(bin: &Element, pattern: &str) -> Result<()> {
     source.set_property("num-buffers", 500i32); // Send buffers then EOS
     let queue = make_queue("queue0", 1024 * 1024 * 4)?;
 
-    let overlay = make_element("textoverlay", "overlay")?;
-    overlay.set_property("text", "Stream not Ready");
-    overlay.set_property_from_str("valignment", "top");
-    overlay.set_property_from_str("halignment", "left");
-    overlay.set_property("font-desc", "Sans, 16");
+    let overlay = make_element("identity", "overlay")?;
     let encoder = make_element("jpegenc", "encoder")?;
     let payload = make_element("rtpjpegpay", "pay0")?;
 
@@ -1138,7 +1201,7 @@ mod tests {
         // These are defined locally in send_to_appsrc but we can verify the logic
         // Reduced from 5 retries (310ms) to 3 retries (70ms) for ALPR latency
         const MAX_RETRIES: u32 = 3;
-        const INITIAL_WAIT_MS: u64 = 10;
+        const INITIAL_WAIT_MS: u64 = 5;
         const BUFFER_THRESHOLD: u64 = 90;
 
         // Max total wait time = 10 + 20 + 40 = 70ms

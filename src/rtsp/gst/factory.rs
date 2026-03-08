@@ -47,7 +47,7 @@ impl NeoMediaFactory {
         // change, which combined with reconnection retries from go2rtc causes
         // the RTSP server to lock up with CLOSE-WAIT connections.
         factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::None);
-        factory.set_launch("videotestsrc pattern=\"snow\" ! video/x-raw,width=896,height=512,framerate=25/1 ! textoverlay name=\"inittextoverlay\" text=\"Stream not Ready\" valignment=top halignment=left font-desc=\"Sans, 32\" ! jpegenc ! rtpjpegpay name=pay0");
+        factory.set_launch("videotestsrc pattern=\"snow\" ! video/x-raw,width=896,height=512,framerate=25/1 ! identity name=\"inittextoverlay\" ! jpegenc ! rtpjpegpay name=pay0");
         factory.set_transport_mode(RTSPTransportMode::PLAY);
         factory
     }
