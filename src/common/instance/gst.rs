@@ -2,7 +2,7 @@ use super::*;
 
 use crate::common::UseCounter;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia};
+use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia, Error as CoreError};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 
 #[cfg(feature = "pushnoti")]
@@ -193,17 +193,25 @@ impl NeoInstance {
                         Box::pin(async move {
                             let mut media_stream = cam.start_video(stream, 0, strict).await?;
                             log::trace!("Camera started");
-                            while let Ok(res) = media_stream.get_data().await {
-                                match res {
-                                    Ok(media) => {
-                                        media_tx.send(media).await?;
+                            loop {
+                                match media_stream.get_data().await {
+                                    Ok(Ok(media)) => {
+                                        if media_tx.send(media).await.is_err() {
+                                            log::trace!("Stream consumer dropped");
+                                            return AnyResult::Ok(());
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        log::debug!("Recovered from stream error: {:?}", e);
+                                    }
+                                    Err(CoreError::StreamFinished) => {
+                                        return Err(CoreError::DroppedConnection.into());
                                     }
                                     Err(e) => {
-                                        log::debug!("Recovered from stream error: {:?}", e);
+                                        return Err(e.into());
                                     }
                                 }
                             }
-                            AnyResult::Ok(())
                         })
                     })
                     .await

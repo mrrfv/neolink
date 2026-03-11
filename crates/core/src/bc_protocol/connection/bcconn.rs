@@ -382,25 +382,15 @@ impl Poller {
                                         let threshold = max_capacity / 10; // 10% remaining
 
                                         if capacity == 0 {
-                                            // Channel full - use try_send to avoid blocking.
-                                            // Blocking here would stall the entire message loop,
-                                            // preventing keepalive ping responses and causing
-                                            // camera connection timeouts.
-                                            match sender.try_send(Ok(response)) {
-                                                Ok(()) => {},
-                                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                                    debug!(
-                                                        "Channel full, dropping frame for msg {} (ID: {})",
-                                                        &msg_num, &msg_id
-                                                    );
-                                                },
-                                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                                    debug!(
-                                                        "Channel closed for msg {} (ID: {})",
-                                                        &msg_num, &msg_id
-                                                    );
-                                                },
-                                            }
+                                            // Message ID 3 carries a byte stream that can span
+                                            // multiple BC packets. Dropping one packet here
+                                            // corrupts downstream frame assembly, so fail fast and
+                                            // reconnect instead of serving damaged media.
+                                            warn!(
+                                                "Channel full for msg {} (ID: {}), reconnecting to preserve stream integrity",
+                                                &msg_num, &msg_id
+                                            );
+                                            return Err(Error::DroppedConnection);
                                         } else {
                                             if capacity <= threshold {
                                                 debug!(

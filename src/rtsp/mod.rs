@@ -52,8 +52,7 @@
 //   - `"test"`: Switches to the gstreamer test image. Requires more cpu as the stream is fully reencoded
 //   - `"none"`: Resends the last iframe the camera. This does not reencode at all.  **Most use cases should use this one as it has the least effort on the cpu and gives what you would expect**
 //
-use anyhow::{anyhow, Context, Result};
-use gstreamer_rtsp_server::prelude::*;
+use anyhow::{Context, Result};
 use log::*;
 use neolink_core::bc_protocol::StreamKind;
 use std::collections::{HashMap, HashSet};
@@ -73,7 +72,6 @@ mod gst;
 mod stream;
 
 use crate::common::{NeoInstance, NeoReactor};
-use factory::*;
 use stream::*;
 
 use super::config::UserConfig;
@@ -298,12 +296,10 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
             .as_stream_kinds()
             .drain(..)
             .collect::<HashSet<_>>();
-        let use_splash = camera_config.borrow().use_splash;
-        let splash_pattern = camera_config.borrow().splash_pattern.to_string();
 
         // This select is for changes to camera_config.stream
         break tokio::select! {
-            v = camera_config.wait_for(|config| config.stream != prev_stream_config || config.permitted_users != prev_stream_users || config.use_splash != use_splash) => {
+            v = camera_config.wait_for(|config| config.stream != prev_stream_config || config.permitted_users != prev_stream_users) => {
                 if let Err(e) = v {
                     AnyResult::Err(e.into())
                 } else {
@@ -328,9 +324,6 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                     None => ["anonymous".to_string()].iter().cloned().collect(),
                 };
 
-                // Create the dummy factory
-                let dummy_factory = make_dummy_factory(use_splash, splash_pattern).await?;
-                dummy_factory.add_permitted_roles(&permitted_users);
                 let mut supported_streams_1 = supported_streams.clone();
                 let mut supported_streams_2 = supported_streams.clone();
                 let mut supported_streams_3 = supported_streams.clone();
@@ -348,20 +341,6 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                         paths.push(
                             format!("/{name}")
                         );
-                        // Create a dummy factory so that the URL will not return 404 while waiting
-                        // for configuration to compete
-                        //
-                        // This is for BI since it will give up forever on a 404 rather then retry
-                        //
-                        let mounts = rtsp
-                            .mount_points()
-                            .ok_or(anyhow!("RTSP server lacks mount point"))?;
-                        for path in paths.iter() {
-                            log::debug!("Path: {}", path);
-                            mounts.add_factory(path, dummy_factory.clone());
-                        }
-                        log::debug!("{}: Preparing at {}", name, paths.join(", "));
-
                         supported_streams_1.wait_for(|ss| ss.contains(&StreamKind::Main)).await?;
                         stream_main(camera.clone(), StreamKind::Main, rtsp, &permitted_users, &paths).await
                     }, if active_streams.contains(&StreamKind::Main) => v,
@@ -380,21 +359,6 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                                 format!("/{name}")
                             );
                         }
-
-                        // Create a dummy factory so that the URL will not return 404 while waiting
-                        // for configuration to compete
-                        //
-                        // This is for BI since it will give up forever on a 404 rather then retry
-                        //
-                        let mounts = rtsp
-                            .mount_points()
-                            .ok_or(anyhow!("RTSP server lacks mount point"))?;
-                        // Create the dummy factory
-                        for path in paths.iter() {
-                            log::debug!("Path: {}", path);
-                            mounts.add_factory(path, dummy_factory.clone());
-                        }
-                        log::debug!("{}: Preparing at {}", name, paths.join(", "));
 
                         supported_streams_2.wait_for(|ss| ss.contains(&StreamKind::Sub)).await?;
 
@@ -415,20 +379,6 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                                 format!("/{name}")
                             );
                         }
-
-                        // Create a dummy factory so that the URL will not return 404 while waiting
-                        // for configuration to compete
-                        //
-                        // This is for BI since it will give up forever on a 404 rather then retry
-                        //
-                        let mounts = rtsp
-                            .mount_points()
-                            .ok_or(anyhow!("RTSP server lacks mount point"))?;
-                        for path in paths.iter() {
-                            log::debug!("Path: {}", path);
-                            mounts.add_factory(path, dummy_factory.clone());
-                        }
-                        log::debug!("{}: Preparing at {}", name, paths.join(", "));
 
                         supported_streams_3.wait_for(|ss| ss.contains(&StreamKind::Extern)).await?;
                         stream_main(camera.clone(), StreamKind::Extern, rtsp, &permitted_users, &paths).await

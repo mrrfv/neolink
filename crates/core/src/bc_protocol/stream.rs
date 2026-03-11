@@ -32,6 +32,18 @@ impl std::fmt::Display for StreamKind {
     }
 }
 
+fn stream_handle(msg_num: u16, stream: StreamKind) -> u32 {
+    // Reolink expects the preview handle to be unique per stream session.
+    // Reusing fixed values (0/256/1024) can leave the camera thinking the
+    // previous session is still active and reject a restart with HTTP-style 400s.
+    let base = u32::from(msg_num).wrapping_add(1) << 8;
+    base | match stream {
+        StreamKind::Main => 0,
+        StreamKind::Sub => 1,
+        StreamKind::Extern => 2,
+    }
+}
+
 /// A handle on currently streaming data
 ///
 /// The data can be pulled using `get_data` which returns raw BcMedia packets
@@ -47,20 +59,26 @@ impl StreamData {
     /// Pull data from the camera's buffer
     /// This returns raw BcMedia packets
     pub async fn get_data(&mut self) -> Result<Result<BcMedia>> {
-        if let Some(handle) = self.handle.as_mut() {
-            if handle.is_finished() {
-                self.abort_handle.cancel();
+        if self.handle.as_ref().is_some_and(|handle| handle.is_finished()) {
+            self.abort_handle.cancel();
+            if let Some(handle) = self.handle.take() {
                 handle.await??;
-                return Err(Error::StreamFinished);
             }
-        } else {
+            return Err(Error::StreamFinished);
+        }
+
+        if self.handle.is_none() {
             self.abort_handle.cancel();
             return Err(Error::StreamFinished);
         }
+
         match self.rx.recv().await {
             Some(data) => Ok(data),
             None => {
                 self.abort_handle.cancel();
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.await?;
+                }
                 Err(Error::StreamFinished)
             }
         }
@@ -146,20 +164,7 @@ impl BcCamera {
                 StreamKind::Extern => 0,
             };
 
-            // Theses are the numbers used with the official client
-            // On an E1 and swann cameras:
-            //  - mainStream always has a value of 0
-            //  - subStream always has a value of 1
-            //  - There is no externStram
-            // On a B800:
-            //  - mainStream is 0
-            //  - subStream is 256
-            //  - externStram is 1024
-            let handle = match stream {
-                StreamKind::Main => 0,
-                StreamKind::Sub => 256,
-                StreamKind::Extern => 1024,
-            };
+            let handle = stream_handle(msg_num, stream);
 
             let stream_name = match stream {
                 StreamKind::Main => "mainStream",
@@ -346,5 +351,17 @@ impl BcCamera {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_handles_are_unique_per_session() {
+        assert_ne!(stream_handle(0, StreamKind::Main), stream_handle(1, StreamKind::Main));
+        assert_ne!(stream_handle(42, StreamKind::Main), stream_handle(42, StreamKind::Sub));
+        assert_ne!(stream_handle(42, StreamKind::Sub), stream_handle(42, StreamKind::Extern));
     }
 }

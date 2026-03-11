@@ -133,7 +133,7 @@ impl NeoMediaFactoryImpl {
                 match new_media {
                     Ok(new_media) => Ok(new_media),
                     Err(e) => {
-                        log::debug!("Media source is currently restarting: {e:?}");
+                        log::warn!("RTSP media factory callback failed: {e:?}");
                         Ok(None)
                     }
                 }

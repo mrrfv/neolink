@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
@@ -9,7 +12,7 @@ use neolink_core::{
         BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe, VideoType,
     },
 };
-use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
+use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle, time::timeout};
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
 
@@ -26,7 +29,24 @@ const AUDIO_BUFFER_SIZE: u32 = 512 * 1416;
 /// a few common sizes (I-frames ~50-100KB, P-frames ~5-20KB), so 32 pools
 /// should be more than sufficient. This prevents memory leaks from cameras
 /// with highly variable frame sizes.
-const MAX_BUFFER_POOLS: usize = 1024;
+const MAX_BUFFER_POOLS: usize = 32;
+
+/// How long to wait for the first video packet before failing stream startup.
+const INITIAL_VIDEO_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// After video is detected, allow a short grace period to discover audio so the
+/// RTSP SDP is stable for the lifetime of the mounted path.
+const INITIAL_AUDIO_GRACE: Duration = Duration::from_secs(2);
+
+/// Delay between attempts to reopen a camera stream after it closes.
+const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Capacity of the per-client media queue.
+///
+/// This queue carries fully parsed `BcMedia` packets, so dropping from here is
+/// recoverable. Keeping it bounded prevents RTSP backpressure from propagating
+/// all the way down into the raw Baichuan packet router.
+const CLIENT_MEDIA_QUEUE_CAPACITY: usize = 500;
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -142,27 +162,37 @@ impl StreamConfig {
     }
 }
 
-pub(super) async fn make_dummy_factory(
-    use_splash: bool,
-    pattern: String,
-) -> AnyResult<NeoMediaFactory> {
-    NeoMediaFactory::new_with_callback(move |element| {
-        clear_bin(&element)?;
-        if !use_splash {
-            Ok(None)
-        } else {
-            build_unknown(&element, &pattern)?;
-            Ok(Some(element))
-        }
-    })
-    .await
-}
-
 enum ClientMsg {
     NewClient {
         element: Element,
-        reply: tokio::sync::oneshot::Sender<Element>,
+        reply: tokio::sync::oneshot::Sender<AnyResult<Element>>,
     },
+}
+
+fn buffer_media(buffer: &mut Vec<BcMedia>, media: BcMedia) {
+    if matches!(media, BcMedia::Iframe(_)) {
+        buffer.clear();
+    }
+
+    buffer.push(media);
+
+    if buffer.len() > 1000 {
+        if let Some(last_iframe) = buffer.iter().rposition(|item| matches!(item, BcMedia::Iframe(_)))
+        {
+            if last_iframe > 0 {
+                let _ = buffer.drain(0..last_iframe);
+                return;
+            }
+        }
+        let _ = buffer.drain(0..500);
+    }
+}
+
+fn should_drop_for_backpressure(media: &BcMedia) -> bool {
+    matches!(
+        media,
+        BcMedia::Aac(_) | BcMedia::Adpcm(_) | BcMedia::Pframe(_)
+    )
 }
 
 pub(super) async fn make_factory(
@@ -170,16 +200,43 @@ pub(super) async fn make_factory(
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
     let (client_tx, mut client_rx) = mpsc(100);
-    // Create the task that creates the pipelines
+    let name = camera.config().await?.borrow().name.clone();
+
+    log::info!("{name}::{stream}: Starting camera stream immediately");
+    let mut media_rx = camera.stream_while_live(stream).await?;
+
+    log::trace!("{name}::{stream}: Learning camera stream type");
+    let mut buffer = vec![];
+    let mut stream_config = StreamConfig::new(&camera, stream).await?;
+    let mut audio_deadline: Option<Instant> = None;
+
+    loop {
+        if stream_config.vid_type.is_some() {
+            audio_deadline.get_or_insert_with(|| Instant::now() + INITIAL_AUDIO_GRACE);
+            if stream_config.aud_type.is_some()
+                || audio_deadline
+                    .map(|deadline| Instant::now() >= deadline)
+                    .unwrap_or(false)
+            {
+                break;
+            }
+        }
+
+        let wait_for = audio_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .filter(|duration| !duration.is_zero())
+            .unwrap_or(INITIAL_VIDEO_TIMEOUT);
+
+        let media = timeout(wait_for, media_rx.recv())
+            .await
+            .with_context(|| format!("{name}::{stream}: timed out waiting for initial media"))?
+            .ok_or_else(|| anyhow!("{name}::{stream}: camera stream ended before RTSP was ready"))?;
+
+        stream_config.update_from_media(&media);
+        buffer_media(&mut buffer, media);
+    }
+
     let thread = tokio::task::spawn(async move {
-        let name = camera.config().await?.borrow().name.clone();
-
-        log::info!("{name}::{stream}: Starting camera stream immediately");
-        let mut media_rx = camera.stream_while_live(stream).await?;
-
-        log::trace!("{name}::{stream}: Learning camera stream type");
-        let mut buffer = vec![];
-        let mut stream_config = StreamConfig::new(&camera, stream).await?;
         let mut active_sender: Option<tokio::sync::mpsc::Sender<BcMedia>> = None;
 
         loop {
@@ -187,84 +244,130 @@ pub(super) async fn make_factory(
                 media_opt = media_rx.recv() => {
                     if let Some(mut media) = media_opt {
                         stream_config.update_from_media(&media);
-                        
+
                         if let Some(sender) = active_sender.as_ref() {
-                            if let Err(tokio::sync::mpsc::error::SendError(returned_media)) = sender.send(media).await {
-                                log::info!("Client sender disconnected for {name}::{stream}");
-                                active_sender = None;
-                                media = returned_media;
-                            } else {
-                                continue;
+                            match sender.try_send(media) {
+                                Ok(()) => continue,
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(returned_media)) => {
+                                    if should_drop_for_backpressure(&returned_media) {
+                                        log::debug!(
+                                            "{name}::{stream}: Dropping media frame under RTSP backpressure"
+                                        );
+                                        continue;
+                                    }
+
+                                    log::warn!(
+                                        "{name}::{stream}: Dropping key video frame under RTSP backpressure"
+                                    );
+                                    continue;
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(returned_media)) => {
+                                    log::info!("Client sender disconnected for {name}::{stream}");
+                                    active_sender = None;
+                                    media = returned_media;
+                                }
                             }
                         }
-                        
-                        if matches!(media, BcMedia::Iframe(_)) {
-                            buffer.clear();
-                        }
-                        buffer.push(media);
-                        if buffer.len() > 1000 {
-                            let _ = buffer.drain(0..500);
-                        }
+
+                        buffer_media(&mut buffer, media);
                     } else {
-                        log::info!("{name}::{stream}: Camera stream ended");
-                        break;
+                        log::warn!("{name}::{stream}: Camera stream channel closed, restarting");
+                        active_sender = None;
+                        loop {
+                            match camera.stream_while_live(stream).await {
+                                Ok(new_media_rx) => {
+                                    media_rx = new_media_rx;
+                                    break;
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "{name}::{stream}: failed to restart camera stream, retrying: {e:?}"
+                                    );
+                                    tokio::time::sleep(STREAM_RETRY_DELAY).await;
+                                }
+                            }
+                        }
                     }
                 }
                 msg_opt = client_rx.recv() => {
                     if let Some(ClientMsg::NewClient { element, reply }) = msg_opt {
                         log::info!("New RTSP client for {name}::{stream}");
-                        clear_bin(&element)?;
+                        let build_result: AnyResult<(Option<AppSrc>, Option<AppSrc>)> = (|| {
+                            clear_bin(&element)?;
 
-                        log::trace!("{name}::{stream}: Building the pipeline");
-                        // Build the right video pipeline
-                        let vid_src = match stream_config.vid_type.as_ref() {
-                            Some(VideoType::H264) => {
-                                let src = build_h264(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            Some(VideoType::H265) => {
-                                let src = build_h265(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            None => {
-                                let config = camera.config().await?.borrow().clone();
-                                build_unknown(&element, &config.splash_pattern.to_string())?;
-                                AnyResult::Ok(None)
-                            }
-                        }?;
+                            log::trace!("{name}::{stream}: Building the pipeline");
+                            let vid_src = match stream_config.vid_type.as_ref() {
+                                Some(VideoType::H264) => {
+                                    let src = build_h264(&element, &stream_config)?;
+                                    Some(src)
+                                }
+                                Some(VideoType::H265) => {
+                                    let src = build_h265(&element, &stream_config)?;
+                                    Some(src)
+                                }
+                                None => {
+                                    return Err(anyhow!("{name}::{stream}: video type not learned"));
+                                }
+                            };
 
-                        // Build the right audio pipeline
-                        let aud_src = match stream_config.aud_type.as_ref() {
-                            Some(AudioType::Aac) => {
-                                let src = build_aac(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            Some(AudioType::Adpcm(block_size)) => {
-                                let src = build_adpcm(&element, *block_size, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            None => AnyResult::Ok(None),
-                        }?;
+                            let aud_src = match stream_config.aud_type.as_ref() {
+                                Some(AudioType::Aac) => match build_aac(&element, &stream_config) {
+                                    Ok(src) => Some(src),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "{name}::{stream}: failed to build AAC audio pipeline, continuing without audio: {e:?}"
+                                        );
+                                        None
+                                    }
+                                },
+                                Some(AudioType::Adpcm(block_size)) => {
+                                    match build_adpcm(&element, *block_size, &stream_config) {
+                                        Ok(src) => Some(src),
+                                        Err(e) => {
+                                            log::warn!(
+                                                "{name}::{stream}: failed to build ADPCM audio pipeline, continuing without audio: {e:?}"
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                None => None,
+                            };
 
-                        if let Some(app) = vid_src.as_ref() {
-                            app.set_callbacks(
-                                AppSrcCallbacks::builder()
-                                    .seek_data(move |_, _seek_pos| true)
-                                    .build(),
-                            );
-                        }
-                        if let Some(app) = aud_src.as_ref() {
-                            app.set_callbacks(
-                                AppSrcCallbacks::builder()
-                                    .seek_data(move |_, _seek_pos| true)
-                                    .build(),
-                            );
-                        }
+                            if let Some(app) = vid_src.as_ref() {
+                                app.set_callbacks(
+                                    AppSrcCallbacks::builder()
+                                        .seek_data(move |_, _seek_pos| true)
+                                        .build(),
+                                );
+                            }
+                            if let Some(app) = aud_src.as_ref() {
+                                app.set_callbacks(
+                                    AppSrcCallbacks::builder()
+                                        .seek_data(move |_, _seek_pos| true)
+                                        .build(),
+                                );
+                            }
+
+                            Ok((vid_src, aud_src))
+                        })();
+
+                        let (vid_src, aud_src) = match build_result {
+                            Ok(srcs) => srcs,
+                            Err(e) => {
+                                log::warn!(
+                                    "{name}::{stream}: failed to build client pipeline, factory remains alive: {e:?}"
+                                );
+                                let _ = reply.send(Err(e));
+                                continue;
+                            }
+                        };
 
                         log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
-                        let _ = reply.send(element);
+                        let _ = reply.send(Ok(element));
 
-                        let (tx, mut rx) = tokio::sync::mpsc::channel(500);
+                        let (tx, mut rx) =
+                            tokio::sync::mpsc::channel(CLIENT_MEDIA_QUEUE_CAPACITY);
                         active_sender = Some(tx);
 
                         let mut to_send = buffer.clone();
@@ -335,7 +438,7 @@ pub(super) async fn make_factory(
         let (reply, new_element) = tokio::sync::oneshot::channel();
         client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
 
-        let element = new_element.blocking_recv()?;
+        let element = new_element.blocking_recv()??;
         Ok(Some(element))
     })
     .await?;
@@ -350,7 +453,7 @@ fn send_to_sources(
     vid_ts: &mut u64,
     vid_camera_ts: &mut Option<u32>,
     aud_ts: &mut u64,
-    _stream_config: &StreamConfig,
+    stream_config: &StreamConfig,
 ) -> AnyResult<()> {
     match data {
         BcMedia::Aac(aac) => {
@@ -371,6 +474,7 @@ fn send_to_sources(
         }
         BcMedia::Iframe(BcMediaIframe { data, microseconds, .. })
         | BcMedia::Pframe(BcMediaPframe { data, microseconds, .. }) => {
+            let frame_interval = 1_000_000u64 / u64::from(stream_config.fps.max(1));
             if let Some(last_camera_ts) = *vid_camera_ts {
                 let mut diff = microseconds as i64 - last_camera_ts as i64;
                 if diff < -2_000_000_000 {
@@ -378,18 +482,18 @@ fn send_to_sources(
                 } else if diff > 2_000_000_000 {
                     diff -= 0x1_0000_0000;
                 }
-                
+
                 if diff.abs() > 5_000_000 {
-                    *vid_ts += 66666; 
+                    *vid_ts += frame_interval;
                 } else {
                     *vid_ts = (*vid_ts as i64 + diff).max(0) as u64;
                 }
             } else {
                 *vid_ts = 0;
             }
-            
+
             *vid_camera_ts = Some(microseconds);
-            
+
             if let Some(vid_src) = vid_src.as_ref() {
                 send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?;
             }
@@ -500,36 +604,6 @@ fn clear_bin(bin: &Element) -> Result<()> {
     for element in bin.iterate_elements().into_iter().flatten() {
         bin.remove(&element)?;
     }
-
-    Ok(())
-}
-
-fn build_unknown(bin: &Element, pattern: &str) -> Result<()> {
-    let bin = bin
-        .clone()
-        .dynamic_cast::<Bin>()
-        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
-    log::debug!("Building Unknown Pipeline");
-    let source = make_element("videotestsrc", "testvidsrc")?;
-    source.set_property_from_str("pattern", pattern);
-    source.set_property("num-buffers", 500i32); // Send buffers then EOS
-    let queue = make_queue("queue0", 1024 * 1024 * 4)?;
-
-    let overlay = make_element("identity", "overlay")?;
-    let encoder = make_element("jpegenc", "encoder")?;
-    let payload = make_element("rtpjpegpay", "pay0")?;
-
-    bin.add_many([&source, &queue, &overlay, &encoder, &payload])?;
-    source.link_filtered(
-        &queue,
-        &Caps::builder("video/x-raw")
-            .field("format", "YUY2")
-            .field("width", 896i32)
-            .field("height", 512i32)
-            .field("framerate", gstreamer::Fraction::new(25, 1))
-            .build(),
-    )?;
-    Element::link_many([&queue, &overlay, &encoder, &payload])?;
 
     Ok(())
 }
