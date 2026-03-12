@@ -169,6 +169,10 @@ enum ClientMsg {
     },
 }
 
+struct ClientState {
+    sender: tokio::sync::mpsc::Sender<BcMedia>,
+}
+
 fn buffer_media(buffer: &mut Vec<BcMedia>, media: BcMedia) {
     if matches!(media, BcMedia::Iframe(_)) {
         buffer.clear();
@@ -202,77 +206,115 @@ pub(super) async fn make_factory(
     let (client_tx, mut client_rx) = mpsc(100);
     let name = camera.config().await?.borrow().name.clone();
 
-    log::info!("{name}::{stream}: Starting camera stream immediately");
-    let mut media_rx = camera.stream_while_live(stream).await?;
-
-    log::trace!("{name}::{stream}: Learning camera stream type");
-    let mut buffer = vec![];
-    let mut stream_config = StreamConfig::new(&camera, stream).await?;
-    let mut audio_deadline: Option<Instant> = None;
-
-    loop {
-        if stream_config.vid_type.is_some() {
-            audio_deadline.get_or_insert_with(|| Instant::now() + INITIAL_AUDIO_GRACE);
-            if stream_config.aud_type.is_some()
-                || audio_deadline
-                    .map(|deadline| Instant::now() >= deadline)
-                    .unwrap_or(false)
-            {
-                break;
-            }
-        }
-
-        let wait_for = audio_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .filter(|duration| !duration.is_zero())
-            .unwrap_or(INITIAL_VIDEO_TIMEOUT);
-
-        let media = timeout(wait_for, media_rx.recv())
-            .await
-            .with_context(|| format!("{name}::{stream}: timed out waiting for initial media"))?
-            .ok_or_else(|| anyhow!("{name}::{stream}: camera stream ended before RTSP was ready"))?;
-
-        stream_config.update_from_media(&media);
-        buffer_media(&mut buffer, media);
-    }
-
     let thread = tokio::task::spawn(async move {
-        let mut active_sender: Option<tokio::sync::mpsc::Sender<BcMedia>> = None;
+        let (mut media_rx, mut buffer, mut stream_config) = loop {
+            log::info!("{name}::{stream}: Starting camera stream immediately");
+            let mut media_rx = match camera.stream_while_live(stream).await {
+                Ok(media_rx) => media_rx,
+                Err(e) => {
+                    log::warn!(
+                        "{name}::{stream}: failed to start camera stream, retrying: {e:?}"
+                    );
+                    tokio::time::sleep(STREAM_RETRY_DELAY).await;
+                    continue;
+                }
+            };
+
+            log::trace!("{name}::{stream}: Learning camera stream type");
+            let mut buffer = vec![];
+            let mut stream_config = StreamConfig::new(&camera, stream).await?;
+            let mut audio_deadline: Option<Instant> = None;
+
+            let ready = loop {
+                if stream_config.vid_type.is_some() {
+                    audio_deadline.get_or_insert_with(|| Instant::now() + INITIAL_AUDIO_GRACE);
+                    if stream_config.aud_type.is_some()
+                        || audio_deadline
+                            .map(|deadline| Instant::now() >= deadline)
+                            .unwrap_or(false)
+                    {
+                        break true;
+                    }
+                }
+
+                let wait_for = audio_deadline
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                    .filter(|duration| !duration.is_zero())
+                    .unwrap_or(INITIAL_VIDEO_TIMEOUT);
+
+                match timeout(wait_for, media_rx.recv()).await {
+                    Ok(Some(media)) => {
+                        stream_config.update_from_media(&media);
+                        buffer_media(&mut buffer, media);
+                    }
+                    Ok(None) => {
+                        log::warn!(
+                            "{name}::{stream}: camera stream ended before RTSP was ready, retrying"
+                        );
+                        break false;
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "{name}::{stream}: timed out waiting for initial media, retrying"
+                        );
+                        break false;
+                    }
+                }
+            };
+
+            if ready {
+                break (media_rx, buffer, stream_config);
+            }
+
+            tokio::time::sleep(STREAM_RETRY_DELAY).await;
+        };
+
+        let mut clients: Vec<ClientState> = Vec::new();
 
         loop {
             tokio::select! {
                 media_opt = media_rx.recv() => {
-                    if let Some(mut media) = media_opt {
+                    if let Some(media) = media_opt {
                         stream_config.update_from_media(&media);
+                        buffer_media(&mut buffer, media.clone());
 
-                        if let Some(sender) = active_sender.as_ref() {
-                            match sender.try_send(media) {
-                                Ok(()) => continue,
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(returned_media)) => {
-                                    if should_drop_for_backpressure(&returned_media) {
-                                        log::debug!(
-                                            "{name}::{stream}: Dropping media frame under RTSP backpressure"
-                                        );
-                                        continue;
+                        if !clients.is_empty() {
+                            let mut still_open = Vec::with_capacity(clients.len());
+                            let drop_ok = should_drop_for_backpressure(&media);
+                            let mut delivered = false;
+
+                            for client in clients.drain(..) {
+                                match client.sender.try_send(media.clone()) {
+                                    Ok(()) => {
+                                        delivered = true;
+                                        still_open.push(client);
                                     }
-
-                                    log::warn!(
-                                        "{name}::{stream}: Dropping key video frame under RTSP backpressure"
-                                    );
-                                    continue;
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(returned_media)) => {
-                                    log::info!("Client sender disconnected for {name}::{stream}");
-                                    active_sender = None;
-                                    media = returned_media;
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        if drop_ok {
+                                            log::debug!(
+                                                "{name}::{stream}: Dropping media frame for one RTSP client under backpressure"
+                                            );
+                                            still_open.push(client);
+                                        } else {
+                                            log::warn!(
+                                                "{name}::{stream}: Dropping key video frame for one RTSP client under backpressure"
+                                            );
+                                            still_open.push(client);
+                                        }
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        log::info!("Client sender disconnected for {name}::{stream}");
+                                    }
                                 }
                             }
-                        }
 
-                        buffer_media(&mut buffer, media);
+                            clients = still_open;
+                            if delivered {
+                                continue;
+                            }
+                        }
                     } else {
                         log::warn!("{name}::{stream}: Camera stream channel closed, restarting");
-                        active_sender = None;
                         loop {
                             match camera.stream_while_live(stream).await {
                                 Ok(new_media_rx) => {
@@ -368,10 +410,9 @@ pub(super) async fn make_factory(
 
                         let (tx, mut rx) =
                             tokio::sync::mpsc::channel(CLIENT_MEDIA_QUEUE_CAPACITY);
-                        active_sender = Some(tx);
+                        clients.push(ClientState { sender: tx });
 
                         let mut to_send = buffer.clone();
-                        buffer.clear();
 
                         let thread_name = format!("{name}::{stream}::sender");
                         let stream_config_clone = stream_config.clone();
@@ -636,6 +677,12 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
+    source.set_caps(Some(
+        &Caps::builder("video/x-h264")
+            .field("stream-format", "byte-stream")
+            .field("alignment", "au")
+            .build(),
+    ));
 
     let source = source
         .dynamic_cast::<Element>()
@@ -665,6 +712,7 @@ fn build_h264(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
     let payload = make_element("rtph264pay", "pay0")?;
+    payload.set_property("config-interval", -1i32);
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
@@ -688,6 +736,12 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
+    source.set_caps(Some(
+        &Caps::builder("video/x-h265")
+            .field("stream-format", "byte-stream")
+            .field("alignment", "au")
+            .build(),
+    ));
 
     let source = source
         .dynamic_cast::<Element>()
@@ -717,6 +771,7 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
     let payload = make_element("rtph265pay", "pay0")?;
+    payload.set_property("config-interval", -1i32);
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)

@@ -80,6 +80,46 @@ use gst::NeoRtspServer;
 
 type AnyResult<T> = anyhow::Result<T, anyhow::Error>;
 
+fn spawn_camera_task(
+    set: &mut JoinSet<AnyResult<String>>,
+    cameras: &mut HashMap<String, CancellationToken>,
+    name: String,
+    thread_cancel: CancellationToken,
+    thread_rtsp: Arc<NeoRtspServer>,
+    thread_reactor: NeoReactor,
+) {
+    if cameras.contains_key(&name) {
+        return;
+    }
+
+    log::info!("{name}: Rtsp Starting");
+    let local_cancel = CancellationToken::new();
+    cameras.insert(name.clone(), local_cancel.clone());
+    set.spawn(async move {
+        let camera = match thread_reactor.get(&name).await {
+            Ok(camera) => camera,
+            Err(e) => {
+                log::error!("{name}: Failed to get camera instance: {e:?}");
+                return AnyResult::Ok(name);
+            }
+        };
+        tokio::select!(
+            _ = thread_cancel.cancelled() => {
+                AnyResult::Ok(name)
+            },
+            _ = local_cancel.cancelled() => {
+                AnyResult::Ok(name)
+            },
+            v = camera_main(camera, &thread_rtsp) => {
+                if let Err(e) = v {
+                    log::error!("{name}: RTSP camera task failed: {e:?}");
+                }
+                AnyResult::Ok(name)
+            },
+        )
+    });
+}
+
 /// Entry point for the rtsp subcommand
 ///
 /// Opt is the command line options
@@ -145,7 +185,7 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
     let thread_rtsp = rtsp.clone();
     let thread_reactor = reactor.clone();
     set.spawn(async move {
-        let mut set = JoinSet::<AnyResult<()>>::new();
+        let mut set = JoinSet::<AnyResult<String>>::new();
         let thread_cancel2 = thread_cancel.clone();
         tokio::select!{
             _ = thread_cancel.cancelled() => AnyResult::Ok(()),
@@ -153,38 +193,54 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
                 let mut cameras: HashMap<String, CancellationToken> = Default::default();
                 let mut config_names = HashSet::new();
                 loop {
-                    config_names = thread_config.wait_for(|config| {
-                        let current_names = config.cameras.iter().filter(|a| a.enabled).map(|cam_config| cam_config.name.clone()).collect::<HashSet<_>>();
-                        current_names != config_names
-                    }).await.with_context(|| "Camera Config Watcher")?.clone().cameras.iter().filter(|a| a.enabled).map(|cam_config| cam_config.name.clone()).collect::<HashSet<_>>();
+                    tokio::select! {
+                        changed = thread_config.wait_for(|config| {
+                            let current_names = config.cameras.iter().filter(|a| a.enabled).map(|cam_config| cam_config.name.clone()).collect::<HashSet<_>>();
+                            current_names != config_names
+                        }) => {
+                            config_names = changed
+                                .with_context(|| "Camera Config Watcher")?
+                                .clone()
+                                .cameras
+                                .iter()
+                                .filter(|a| a.enabled)
+                                .map(|cam_config| cam_config.name.clone())
+                                .collect::<HashSet<_>>();
 
-                    for name in config_names.iter() {
-                        if ! cameras.contains_key(name) {
-                            log::info!("{name}: Rtsp Starting");
-                            let local_cancel = CancellationToken::new();
-                            cameras.insert(name.clone(),local_cancel.clone() );
-                            let thread_global_cancel = thread_cancel2.clone();
-                            let thread_rtsp2 = thread_rtsp.clone();
-                            let thread_reactor2 = thread_reactor.clone();
-                            let name = name.clone();
-                            set.spawn(async move {
-                                let camera = thread_reactor2.get(&name).await?;
-                                tokio::select!(
-                                    _ = thread_global_cancel.cancelled() => {
-                                        AnyResult::Ok(())
-                                    },
-                                    _ = local_cancel.cancelled() => {
-                                        AnyResult::Ok(())
-                                    },
-                                    v = camera_main(camera, &thread_rtsp2) => v,
-                                )
-                            }) ;
+                            for name in config_names.iter().cloned() {
+                                spawn_camera_task(
+                                    &mut set,
+                                    &mut cameras,
+                                    name,
+                                    thread_cancel2.clone(),
+                                    thread_rtsp.clone(),
+                                    thread_reactor.clone(),
+                                );
+                            }
+
+                            for (running_name, token) in cameras.iter() {
+                                if !config_names.contains(running_name) {
+                                    token.cancel();
+                                }
+                            }
                         }
-                    }
+                        Some(joined) = set.join_next() => {
+                            let completed_name = joined
+                                .map_err(anyhow::Error::from)
+                                .and_then(|res| res)?;
+                            cameras.remove(&completed_name);
 
-                    for (running_name, token) in cameras.iter() {
-                        if ! config_names.contains(running_name) {
-                            token.cancel();
+                            if config_names.contains(&completed_name) && !thread_cancel2.is_cancelled() {
+                                log::warn!("{completed_name}: RTSP task exited, restarting");
+                                spawn_camera_task(
+                                    &mut set,
+                                    &mut cameras,
+                                    completed_name,
+                                    thread_cancel2.clone(),
+                                    thread_rtsp.clone(),
+                                    thread_reactor.clone(),
+                                );
+                            }
                         }
                     }
                 }

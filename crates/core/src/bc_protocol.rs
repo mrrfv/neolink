@@ -245,64 +245,71 @@ impl BcCamera {
                         // New discovery to get new client IDs
                         discovery = Discovery::new().await?;
                     };
-                    tokio::select! {
-                        Ok(v) = async {
-                            let uid_remote = uid.clone();
-                            info!("{}: Trying remote discovery", options.name);
-                            let result = discovery
-                                .remote(&uid_remote, &reg_result)
-                                .await;
-                            match result {
-                                Ok(disc) => {
-                                    info!(
-                                        "{}: Remote discovery success {} at {}",
-                                        options.name,
-                                        uid_remote,
-                                        disc.get_addr()
-                                    );
-                                    Ok(CameraLocation::Udp(disc))
-                                },
-                                Err(e) => Err(e)
+                    // Prefer the most direct discovery results first. Racing all methods lets
+                    // relay "win" over a direct path, which is faster to establish but much
+                    // less stable for long-running RTSP streams.
+                    if allow_remote {
+                        let uid_remote = uid.clone();
+                        info!("{}: Trying remote discovery", options.name);
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(5),
+                            discovery.remote(&uid_remote, &reg_result),
+                        )
+                        .await
+                        {
+                            Ok(Ok(disc)) => {
+                                info!(
+                                    "{}: Remote discovery success {} at {}",
+                                    options.name,
+                                    uid_remote,
+                                    disc.get_addr()
+                                );
+                                return Ok(CameraLocation::Udp(disc));
                             }
-                        }, if allow_remote => Ok(v),
-                        Ok(v) = async {
-                            let uid_map = uid.clone();
-                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-                            info!("{}: Trying map discovery", options.name);
-                            let result = discovery.map(&reg_result).await;
-                            match result {
-                                Ok(disc) => {
-                                    info!(
-                                        "{}: Map success {} at {}",
-                                        options.name,
-                                        uid_map,
-                                        disc.get_addr()
-                                    );
-                                    Ok(CameraLocation::Udp(disc))
-                                },
-                                Err(e) => Err(e),
+                            Ok(Err(e)) => {
+                                debug!("{}: Remote discovery failed: {:?}", options.name, e);
                             }
-                        }, if allow_map => Ok(v),
-                        Ok(v) = async {
-                            let uid_relay = uid.clone();
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                            info!("{}: Trying relay discovery", options.name);
-                            let result = discovery.relay(&reg_result).await;
-                            match result {
-                                Ok(disc) => {
-                                    info!(
-                                        "{}: Relay success {} at {}",
-                                        options.name,
-                                        uid_relay,
-                                        disc.get_addr()
-                                    );
-                                    Ok(CameraLocation::Udp(disc))
-                                },
-                                Err(e) => Err(e),
+                            Err(_) => {
+                                debug!("{}: Remote discovery timed out, trying fallback", options.name);
                             }
-                        }, if allow_relay => Ok(v),
-                        else => Err(Error::DiscoveryTimeout),
+                        }
                     }
+
+                    if allow_map {
+                        let uid_map = uid.clone();
+                        info!("{}: Trying map discovery", options.name);
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(5),
+                            discovery.map(&reg_result),
+                        )
+                        .await
+                        {
+                            Ok(Ok(disc)) => {
+                                info!(
+                                    "{}: Map success {} at {}",
+                                    options.name,
+                                    uid_map,
+                                    disc.get_addr()
+                                );
+                                return Ok(CameraLocation::Udp(disc));
+                            }
+                            Ok(Err(e)) => {
+                                debug!("{}: Map discovery failed: {:?}", options.name, e);
+                            }
+                            Err(_) => {
+                                debug!("{}: Map discovery timed out, trying relay", options.name);
+                            }
+                        }
+                    }
+
+                    if allow_relay {
+                        debug!(
+                            "{}: Skipping relay discovery fallback; waiting for a direct path is more reliable for long-lived RTSP streaming",
+                            options.name
+                        );
+                    }
+
+                    Err(Error::DiscoveryTimeout)
                 }, if allow_remote || allow_map || allow_relay => Ok(v),
                 else => Err(Error::DiscoveryTimeout),
             }?;

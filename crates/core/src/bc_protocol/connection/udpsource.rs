@@ -37,6 +37,9 @@ use tokio_util::{
 
 const MTU: usize = 1350;
 const UDPDATA_HEADER_SIZE: usize = 20;
+const SOCKET_CHANNEL_CAPACITY: usize = 2000;
+const SOCKET_SEND_TIMEOUT: Duration = Duration::from_millis(250);
+const UDP_RECV_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub(crate) type InnerFramed = Framed<Compat<IntoAsyncRead<UdpPayloadSource>>, BcCodex>;
 pub(crate) struct UdpSource {
@@ -329,8 +332,9 @@ impl UdpPayloadInner {
         // In order to achieve this we use dedicated threads for ACK
         // and the socket
 
-        let (socket_in_tx, socket_in_rx) = channel::<BcUdp>(500);
-        let (socket_out_tx, socket_out_rx) = channel::<(BcUdp, SocketAddr)>(500);
+        let (socket_in_tx, socket_in_rx) = channel::<BcUdp>(SOCKET_CHANNEL_CAPACITY);
+        let (socket_out_tx, socket_out_rx) =
+            channel::<(BcUdp, SocketAddr)>(SOCKET_CHANNEL_CAPACITY);
         // let (mut socket_tx, mut socket_rx) = inner.split();
 
         // Send/Recv on the socket
@@ -340,8 +344,7 @@ impl UdpPayloadInner {
         let socket_out_tx = socket_out_tx.clone();
         let thread_client_id = client_id;
         let thread_camera_id = camera_id;
-        const TIME_OUT: u64 = 10;
-        let mut recv_timeout = Box::pin(sleep(Duration::from_secs(TIME_OUT)));
+        let mut recv_timeout = Box::pin(sleep(UDP_RECV_TIMEOUT));
         set.spawn(async move {
             let result = tokio::select! {
                 _ = send_cancel.cancelled() => {
@@ -356,14 +359,20 @@ impl UdpPayloadInner {
                             packet = inner.next() => {
                                 log::trace!("Cam->App");
                                 let packet = packet.ok_or(Error::BcUdpDropReciver(BcUdpDropReciverKind::NoneRecieved))??;
-                                recv_timeout.as_mut().reset(Instant::now() + Duration::from_secs(TIME_OUT));
+                                recv_timeout.as_mut().reset(Instant::now() + UDP_RECV_TIMEOUT);
                                 // let packet = socket_rx.next().await.ok_or(Error::BcUdpDropReciver)??;
-                                socket_out_tx.try_send(packet).map_err(|e| Error::BcUdpDropReciver(BcUdpDropReciverKind::SendFailed(format!("{e:?}"))))?;
+                                tokio::time::timeout(SOCKET_SEND_TIMEOUT, socket_out_tx.send(packet))
+                                    .await
+                                    .map_err(|_| {
+                                        Error::BcUdpDropReciver(BcUdpDropReciverKind::SendFailed(
+                                            "timed out delivering packet to payload queue".to_string(),
+                                        ))
+                                    })??;
                                 continue;
                             },
                             packet = socket_in_rx.next() => {
                                 let packet = packet.ok_or(Error::BcUdpDropSender)?;
-                                match tokio::time::timeout(tokio::time::Duration::from_millis(250), inner.send((packet, thread_camera_addr))).await {
+                                match tokio::time::timeout(SOCKET_SEND_TIMEOUT, inner.send((packet, thread_camera_addr))).await {
                                     Ok(written) => {
                                         written?;
                                     }
@@ -372,8 +381,8 @@ impl UdpPayloadInner {
                                         // Socket is (maybe) broken
                                         // Seems to happen with network reconnects like over
                                         // a lossy cellular network
-                                        let stream = Arc::new(tokio::time::timeout(tokio::time::Duration::from_millis(250), connect_try_port(inner.inner.get_ref().local_addr()?.port())).await.map_err(|_| Error::BcUdpReconnectTimeout)??);
-                                        inner = tokio::time::timeout(tokio::time::Duration::from_millis(250), BcUdpSource::new_from_socket(stream, inner.addr)).await.map_err(|_| Error::BcUdpReconnectTimeout)??;
+                                        let stream = Arc::new(tokio::time::timeout(SOCKET_SEND_TIMEOUT, connect_try_port(inner.inner.get_ref().local_addr()?.port())).await.map_err(|_| Error::BcUdpReconnectTimeout)??);
+                                        inner = tokio::time::timeout(SOCKET_SEND_TIMEOUT, BcUdpSource::new_from_socket(stream, inner.addr)).await.map_err(|_| Error::BcUdpReconnectTimeout)??;
 
                                         // Inform the camera that we are the same client
                                         //
@@ -389,7 +398,7 @@ impl UdpPayloadInner {
                                                     did: thread_camera_id,
                                                 }),
                                         });
-                                        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(250), inner.send((msg, thread_camera_addr))).await;
+                                        let _ = tokio::time::timeout(SOCKET_SEND_TIMEOUT, inner.send((msg, thread_camera_addr))).await;
                                     }
                                 }
 

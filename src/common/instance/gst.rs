@@ -185,42 +185,38 @@ impl NeoInstance {
         let config = self.config().await?.borrow().clone();
         let strict = config.strict;
         let thread_camera = self.clone();
-        tokio::task::spawn(
-            tokio::task::spawn(async move {
-                thread_camera
-                    .run_task(move |cam| {
-                        let media_tx = media_tx.clone();
-                        Box::pin(async move {
-                            let mut media_stream = cam.start_video(stream, 0, strict).await?;
-                            log::trace!("Camera started");
-                            loop {
-                                match media_stream.get_data().await {
-                                    Ok(Ok(media)) => {
-                                        if media_tx.send(media).await.is_err() {
-                                            log::trace!("Stream consumer dropped");
-                                            return AnyResult::Ok(());
-                                        }
-                                    }
-                                    Ok(Err(e)) => {
-                                        log::debug!("Recovered from stream error: {:?}", e);
-                                    }
-                                    Err(CoreError::StreamFinished) => {
-                                        return Err(CoreError::DroppedConnection.into());
-                                    }
-                                    Err(e) => {
-                                        return Err(e.into());
+        tokio::task::spawn(async move {
+            let result = thread_camera
+                .run_task(move |cam| {
+                    let media_tx = media_tx.clone();
+                    Box::pin(async move {
+                        let mut media_stream = cam.start_video(stream, 0, strict).await?;
+                        log::trace!("Camera started");
+                        loop {
+                            match media_stream.get_data().await {
+                                Ok(Ok(media)) => {
+                                    if media_tx.send(media).await.is_err() {
+                                        log::trace!("Stream consumer dropped");
+                                        return AnyResult::Ok(());
                                     }
                                 }
+                                Ok(Err(e)) => {
+                                    log::debug!("Recovered from stream error: {:?}", e);
+                                }
+                                Err(CoreError::StreamFinished) => {
+                                    return Err(CoreError::DroppedConnection.into());
+                                }
+                                Err(e) => {
+                                    return Err(e.into());
+                                }
                             }
-                        })
+                        }
                     })
-                    .await
-            })
-            .and_then(|res| async move {
-                log::debug!("Camera finished streaming: {res:?}");
-                Ok(())
-            }),
-        );
+                })
+                .await;
+
+            log::debug!("Camera finished streaming: {result:?}");
+        });
 
         Ok(media_rx)
     }
