@@ -13,6 +13,8 @@ use tokio::{
     },
     time::{sleep, Duration},
 };
+
+const PASSIVE_RETRY_LIMIT: usize = 6;
 use tokio_util::sync::CancellationToken;
 
 use super::{MdState, NeoCamCommand, NeoCamThreadState, Permit};
@@ -100,8 +102,20 @@ impl NeoInstance {
         )
             -> std::pin::Pin<Box<dyn futures::Future<Output = AnyResult<T>> + Send + 'a>>,
     {
+        let name = self.config().await?.borrow().name.clone();
         let mut camera_watch = self.camera_watch.clone();
         let mut camera = None;
+        let mut retry_count = 0usize;
+        macro_rules! retry_continue {
+            () => {{
+                retry_count += 1;
+                if retry_count >= PASSIVE_RETRY_LIMIT {
+                    return Err(anyhow!("{name}: passive task exceeded {PASSIVE_RETRY_LIMIT} retries").into());
+                }
+                continue;
+            }};
+        }
+
 
         loop {
             camera = camera_watch
@@ -149,22 +163,25 @@ impl NeoInstance {
                 }, if camera.is_some() => {
                     match v {
                         // Ok means we are done
-                        Ok(v) => Ok(v),
+                        Ok(v) => {
+                            retry_count = 0;
+                            Ok(v)
+                        }
                         // If error we check for retryable errors
                         Err(e) => {
                             match e.downcast::<neolink_core::Error>() {
                                 Ok(neolink_core::Error::DroppedConnection) | Ok(neolink_core::Error::TimeoutDisconnected) => {
-                                    continue;
+                                    retry_continue!();
                                 },
                                 Ok(neolink_core::Error::TokioBcSendError) => {
-                                    continue;
+                                    retry_continue!();
                                 },
                                 Ok(neolink_core::Error::Io(e)) => {
                                     use std::io::ErrorKind::*;
                                     if let ConnectionReset | ConnectionAborted | BrokenPipe | TimedOut =  e.kind() {
                                         // Resetable IO
                                         log::trace!("    - Neolink Std IO Error: Continue");
-                                        continue;
+                                        retry_continue!();
                                     } else {
                                         // Check if  the inner error is the Other type and then the discomnect
                                         let is_dropped = e.get_ref().is_some_and(|e| {
@@ -176,7 +193,7 @@ impl NeoInstance {
                                         if is_dropped {
                                             // Retry is a None
                                             log::trace!("    - Neolink Std IO Error => Neolink: Continue");
-                                            continue;
+                                            retry_continue!();
                                         } else {
                                             log::trace!("    - Neolink Std IO Error: Other");
                                             Err(e.into())
@@ -198,7 +215,7 @@ impl NeoInstance {
                                             if let ConnectionReset | ConnectionAborted | BrokenPipe | TimedOut =  e.kind() {
                                                 // Resetable IO
                                                 log::trace!("      - Std IO Error: Continue");
-                                                continue;
+                                                retry_continue!();
                                             } else {
                                                 let is_dropped = e.get_ref().is_some_and(|e| {
                                                     log::trace!("Std IO Error: Inner: {:?}", e);
@@ -209,7 +226,7 @@ impl NeoInstance {
                                                 if is_dropped {
                                                     // Retry is a None
                                                     log::trace!("      - Std IO Error => Neolink Error: Continue");
-                                                    continue;
+                                                    retry_continue!();
                                                 } else {
                                                     log::trace!("      - Std IO Error: Other");
                                                     Err(e.into())

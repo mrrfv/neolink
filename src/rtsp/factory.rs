@@ -47,6 +47,7 @@ const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// recoverable. Keeping it bounded prevents RTSP backpressure from propagating
 /// all the way down into the raw Baichuan packet router.
 const CLIENT_MEDIA_QUEUE_CAPACITY: usize = 500;
+const MAX_BOOTSTRAP_FRAMES: usize = 256;
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -180,7 +181,7 @@ fn buffer_media(buffer: &mut Vec<BcMedia>, media: BcMedia) {
 
     buffer.push(media);
 
-    if buffer.len() > 1000 {
+    if buffer.len() > MAX_BOOTSTRAP_FRAMES {
         if let Some(last_iframe) = buffer.iter().rposition(|item| matches!(item, BcMedia::Iframe(_)))
         {
             if last_iframe > 0 {
