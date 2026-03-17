@@ -41,6 +41,10 @@ const INITIAL_AUDIO_GRACE: Duration = Duration::from_secs(2);
 /// Delay between attempts to reopen a camera stream after it closes.
 const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// If the camera stops producing packets but never hard-closes the channel,
+/// rebuild the stream rather than letting the client sit on stale media.
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Capacity of the per-client media queue.
 ///
 /// This queue carries fully parsed `BcMedia` packets, so dropping from here is
@@ -200,6 +204,28 @@ fn should_drop_for_backpressure(media: &BcMedia) -> bool {
     )
 }
 
+fn is_keyframe(media: &BcMedia) -> bool {
+    matches!(media, BcMedia::Iframe(_))
+}
+
+async fn reopen_stream(
+    camera: &NeoInstance,
+    stream: StreamKind,
+    name: &str,
+) -> AnyResult<tokio::sync::mpsc::Receiver<BcMedia>> {
+    loop {
+        match camera.stream_while_live(stream).await {
+            Ok(new_media_rx) => return Ok(new_media_rx),
+            Err(e) => {
+                log::warn!(
+                    "{name}::{stream}: failed to restart camera stream, retrying: {e:?}"
+                );
+                tokio::time::sleep(STREAM_RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
 pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
@@ -274,64 +300,65 @@ pub(super) async fn make_factory(
 
         loop {
             tokio::select! {
-                media_opt = media_rx.recv() => {
-                    if let Some(media) = media_opt {
-                        stream_config.update_from_media(&media);
-                        buffer_media(&mut buffer, media.clone());
+                media_opt = tokio::time::timeout(STREAM_STALL_TIMEOUT, media_rx.recv()) => {
+                    match media_opt {
+                        Ok(Some(media)) => {
+                            stream_config.update_from_media(&media);
+                            buffer_media(&mut buffer, media.clone());
 
-                        if !clients.is_empty() {
-                            let mut still_open = Vec::with_capacity(clients.len());
-                            let drop_ok = should_drop_for_backpressure(&media);
-                            let mut delivered = false;
+                            if !clients.is_empty() {
+                                let mut still_open = Vec::with_capacity(clients.len());
+                                let drop_ok = should_drop_for_backpressure(&media);
+                                let mut delivered = false;
 
-                            for client in clients.drain(..) {
-                                match client.sender.try_send(media.clone()) {
-                                    Ok(()) => {
-                                        delivered = true;
-                                        still_open.push(client);
-                                    }
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                        if drop_ok {
-                                            log::debug!(
-                                                "{name}::{stream}: Dropping media frame for one RTSP client under backpressure"
-                                            );
-                                            still_open.push(client);
-                                        } else {
-                                            log::warn!(
-                                                "{name}::{stream}: Dropping key video frame for one RTSP client under backpressure"
-                                            );
+                                for client in clients.drain(..) {
+                                    match client.sender.try_send(media.clone()) {
+                                        Ok(()) => {
+                                            delivered = true;
                                             still_open.push(client);
                                         }
-                                    }
-                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                        log::info!("Client sender disconnected for {name}::{stream}");
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            if drop_ok {
+                                                log::debug!(
+                                                    "{name}::{stream}: Dropping media frame for one RTSP client under backpressure"
+                                                );
+                                                still_open.push(client);
+                                            } else if is_keyframe(&media) {
+                                                log::warn!(
+                                                    "{name}::{stream}: Dropping RTSP client because a keyframe could not be queued"
+                                                );
+                                            } else {
+                                                log::warn!(
+                                                    "{name}::{stream}: Backpressure on non-droppable media, keeping RTSP client"
+                                                );
+                                                still_open.push(client);
+                                            }
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            log::info!("Client sender disconnected for {name}::{stream}");
+                                        }
                                     }
                                 }
-                            }
 
-                            clients = still_open;
-                            if delivered {
-                                continue;
+                                clients = still_open;
+                                if delivered {
+                                    continue;
+                                }
                             }
                         }
-                    } else {
-                        log::warn!("{name}::{stream}: Camera stream channel closed, restarting");
-                        loop {
-                            match camera.stream_while_live(stream).await {
-                                Ok(new_media_rx) => {
-                                    media_rx = new_media_rx;
-                                    break;
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "{name}::{stream}: failed to restart camera stream, retrying: {e:?}"
-                                    );
-                                    tokio::time::sleep(STREAM_RETRY_DELAY).await;
-                                }
-                            }
+                        Ok(None) => {
+                            log::warn!("{name}::{stream}: Camera stream channel closed, restarting");
+                            media_rx = reopen_stream(&camera, stream, &name).await?;
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "{name}::{stream}: No media received for {:?}, restarting stream",
+                                STREAM_STALL_TIMEOUT
+                            );
+                            media_rx = reopen_stream(&camera, stream, &name).await?;
                         }
                     }
-                }
+                },
                 msg_opt = client_rx.recv() => {
                     if let Some(ClientMsg::NewClient { element, reply }) = msg_opt {
                         log::info!("New RTSP client for {name}::{stream}");
@@ -423,6 +450,8 @@ pub(super) async fn make_factory(
                                 let mut vid_ts: u64 = 0;
                                 let mut vid_camera_ts: Option<u32> = None;
                                 let mut aud_ts: u64 = 0;
+                                let mut last_vid_ts: Option<u64> = None;
+                                let mut last_aud_ts: Option<u64> = None;
                                 let mut pools = Default::default();
 
                                 log::trace!("Sending buffered frames");
@@ -435,6 +464,8 @@ pub(super) async fn make_factory(
                                         &mut vid_ts,
                                         &mut vid_camera_ts,
                                         &mut aud_ts,
+                                        &mut last_vid_ts,
+                                        &mut last_aud_ts,
                                         &stream_config_clone,
                                     );
                                     if let Err(r) = r {
@@ -452,6 +483,8 @@ pub(super) async fn make_factory(
                                         &mut vid_ts,
                                         &mut vid_camera_ts,
                                         &mut aud_ts,
+                                        &mut last_vid_ts,
+                                        &mut last_aud_ts,
                                         &stream_config_clone,
                                     );
                                     if let Err(r) = &r {
@@ -495,12 +528,15 @@ fn send_to_sources(
     vid_ts: &mut u64,
     vid_camera_ts: &mut Option<u32>,
     aud_ts: &mut u64,
+    last_vid_ts: &mut Option<u64>,
+    last_aud_ts: &mut Option<u64>,
     stream_config: &StreamConfig,
 ) -> AnyResult<()> {
     match data {
         BcMedia::Aac(aac) => {
             if let Some(duration) = aac.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
+                    ensure_monotonic_timestamp(aud_ts, last_aud_ts, duration as u64);
                     send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts), pools)?;
                 }
                 *aud_ts += duration as u64;
@@ -509,6 +545,7 @@ fn send_to_sources(
         BcMedia::Adpcm(adpcm) => {
             if let Some(duration) = adpcm.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
+                    ensure_monotonic_timestamp(aud_ts, last_aud_ts, duration as u64);
                     send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts), pools)?;
                 }
                 *aud_ts += duration as u64;
@@ -537,6 +574,7 @@ fn send_to_sources(
             *vid_camera_ts = Some(microseconds);
 
             if let Some(vid_src) = vid_src.as_ref() {
+                ensure_monotonic_timestamp(vid_ts, last_vid_ts, frame_interval);
                 send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?;
             }
         }
@@ -627,6 +665,14 @@ fn send_to_appsrc(
     }?;
     
     Ok(())
+}
+fn ensure_monotonic_timestamp(current: &mut u64, last: &mut Option<u64>, minimum_step: u64) {
+    if let Some(previous) = last {
+        if *current <= *previous {
+            *current = previous.saturating_add(minimum_step.max(1));
+        }
+    }
+    *last = Some(*current);
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;

@@ -133,6 +133,7 @@ impl NeoInstance {
                 _ = camera_watch.wait_for(|new_cam| !Weak::ptr_eq(new_cam, &camera.as_ref().map(Arc::downgrade).unwrap_or_default())).map_ok(|new_cam| new_cam.upgrade()) => {
                     // Camera value has changed!
                     // Go back and see how it changed
+                    retry_count = 0;
                     continue;
                 },
                 v = async {
@@ -163,10 +164,7 @@ impl NeoInstance {
                 }, if camera.is_some() => {
                     match v {
                         // Ok means we are done
-                        Ok(v) => {
-                            retry_count = 0;
-                            Ok(v)
-                        }
+                        Ok(v) => Ok(v),
                         // If error we check for retryable errors
                         Err(e) => {
                             match e.downcast::<neolink_core::Error>() {

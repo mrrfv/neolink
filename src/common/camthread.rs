@@ -139,7 +139,9 @@ impl NeoCamThread {
     // A watch sender is used to send the new camera
     // whenever it changes
     pub(crate) async fn run(&mut self) -> AnyResult<()> {
-        const MAX_BACKOFF: Duration = Duration::from_secs(5);
+        // Keep reconnect attempts fairly aggressive so a brief camera reset does
+        // not turn into a long RTSP outage for Frigate.
+        const MAX_BACKOFF: Duration = Duration::from_secs(1);
         const MIN_BACKOFF: Duration = Duration::from_millis(50);
 
         let mut backoff = MIN_BACKOFF;

@@ -1,7 +1,7 @@
 use crate::mqtt::Discoveries;
 #[cfg(feature = "gstreamer")]
 use neolink_core::bc_protocol::StreamKind;
-use neolink_core::bc_protocol::{DiscoveryMethods, PrintFormat};
+use neolink_core::bc_protocol::{ConnectionProtocol, DiscoveryMethods, PrintFormat};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -218,6 +218,9 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_false", alias = "idle", alias = "idle_disc")]
     pub(crate) idle_disconnect: bool,
+
+    #[serde(default = "default_connection_protocol", alias = "protocol")]
+    pub(crate) protocol: ConnectionProtocol,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
@@ -504,6 +507,10 @@ fn default_buffer_duration() -> u64 {
 
 fn default_max_discovery_retries() -> usize {
     10
+}
+
+fn default_connection_protocol() -> ConnectionProtocol {
+    ConnectionProtocol::Udp
 }
 
 fn default_2000() -> u64 {

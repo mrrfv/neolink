@@ -121,14 +121,17 @@ pub enum PrintFormat {
 }
 
 /// Type of connection to try
-#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ConnectionProtocol {
     /// TCP and UDP
     #[default]
+    #[serde(alias = "tcpudp", alias = "tcp_udp", alias = "TCPUDP", alias = "TCP_UDP")]
     TcpUdp,
     /// TCP only
+    #[serde(alias = "tcp", alias = "TCP")]
     Tcp,
     /// Udp only
+    #[serde(alias = "udp", alias = "UDP")]
     Udp,
 }
 
@@ -142,6 +145,10 @@ impl BcCamera {
     /// the location that should be used
     async fn find_camera(options: &BcCameraOpt) -> Result<CameraLocation> {
         let discovery = Discovery::new().await?;
+        let can_try_udp = matches!(
+            options.protocol,
+            ConnectionProtocol::Udp | ConnectionProtocol::TcpUdp
+        ) || (matches!(options.protocol, ConnectionProtocol::Tcp) && options.uid.is_some());
         if let ConnectionProtocol::Tcp | ConnectionProtocol::TcpUdp = options.protocol {
             let mut sockets = vec![];
             match options.port {
@@ -168,11 +175,16 @@ impl BcCamera {
                         return Ok(CameraLocation::Tcp(addr));
                     }
                 }
+                if options.protocol == ConnectionProtocol::Tcp && can_try_udp {
+                    log::warn!(
+                        "{}: TCP discovery failed, trying UDP fallback because a UID is available",
+                        options.name
+                    );
+                }
             }
         }
 
-        if let (Some(uid), ConnectionProtocol::Udp | ConnectionProtocol::TcpUdp) =
-            (options.uid.as_ref(), options.protocol)
+        if let (Some(uid), true) = (options.uid.as_ref(), can_try_udp)
         {
             let mut sockets = vec![];
             match options.port {

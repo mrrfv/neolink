@@ -3,6 +3,19 @@
 ![CI](https://github.com/QuantumEntangledAndy/neolink/workflows/CI/badge.svg)
 [![dependency status](https://deps.rs/repo/github/QuantumEntangledAndy/neolink/status.svg)](https://deps.rs/repo/github/QuantumEntangledAndy/neolink)
 
+## mrrfv/neolink
+
+I forked [joshkautz's neolink fork](https://github.com/joshkautz/neolink) as an attempt to fix Neolink's reliability specifically for use with NVR software like Frigate. This code remains experimental, but I'm using it in my personal setup with more success than the original.
+
+Changes:
+
+- Refactored discovery mechanism to prioritize direct paths over relays
+- Fixed stream handle generation to use unique per-session handles
+- Refactor of media factory system
+- Implemented an automatic retry mechanism for failed camera tasks
+
+---
+
 Neolink is a small program that acts as a proxy between Reolink IP cameras and
 normal RTSP clients.
 Certain cameras, such as the Reolink B800, do not implement ONVIF or RTSP, but
@@ -393,6 +406,7 @@ debug = false # Displays Debug XML messages from camera
 enabled = true # Enable or Disable the camera
 update_time = false # When camera connects, force the setting of the camera date/time to now. The default is false
 print_format = "None"  # Type of format that logs are displayed in (None, Human, Xml). The default is None
+protocol = "Udp" # Default. Choose Tcp or TcpUdp if your network needs it.
 ```
 
 - **Debug:** Will dump the various XMLs from the camera as they are recieved
@@ -408,6 +422,7 @@ ssue a user had)
 
 - **print_format:** Used for adjusting printing of some values mostly, battery
 messages
+- **protocol:** Controls the underlying Baichuan transport. `Udp` is the default, `Tcp` is useful on especially noisy LANs, and `TcpUdp` lets NeoLink try both. If you only configure an address and no `uid`, NeoLink falls back to `Tcp` because UDP discovery needs a UID.
 
 ### Pause
 

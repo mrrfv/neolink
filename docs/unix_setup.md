@@ -109,6 +109,7 @@ name = "driveway"
 username = "admin"
 password = "12345678"
 address = "192.168.1.187:9000"
+protocol = "Udp"
 ```
 
 Set the `name` to any value you want, this will be the name of the rtsp stream.

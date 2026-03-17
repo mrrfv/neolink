@@ -87,13 +87,25 @@ impl AddressOrUid {
             }
         }?;
 
+        let protocol = if matches!(camera_config.protocol, ConnectionProtocol::Udp)
+            && camera_config.camera_uid.is_none()
+        {
+            warn!(
+                "{}: protocol=Udp requires a uid; falling back to Tcp for address-based discovery",
+                camera_config.name
+            );
+            ConnectionProtocol::Tcp
+        } else {
+            camera_config.protocol
+        };
+
         let options = BcCameraOpt {
             name: camera_config.name.clone(),
             channel_id: camera_config.channel_id,
             addrs,
             port,
             uid: camera_config.camera_uid.clone(),
-            protocol: ConnectionProtocol::TcpUdp,
+            protocol,
             discovery: camera_config.discovery,
             credentials: Credentials {
                 username: camera_config.username.clone(),

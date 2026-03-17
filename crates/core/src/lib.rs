@@ -17,7 +17,7 @@
 //!     addrs: ["192.168.1.1".parse().unwrap()].to_vec(),
 //!     port: Some(9000),
 //!     uid: Some("CAMUID".to_string()),
-//!     protocol: ConnectionProtocol::TcpUdp,
+//!     protocol: ConnectionProtocol::Udp,
 //!     discovery: DiscoveryMethods::Relay,
 //!     credentials: Credentials {
 //!         username: "username".to_string(),
@@ -41,7 +41,7 @@
 //! #    addrs: ["192.168.1.1".parse().unwrap()].to_vec(),
 //! #    port: Some(9000),
 //! #    uid: Some("CAMUID".to_string()),
-//! #    protocol: ConnectionProtocol::TcpUdp,
+//! #    protocol: ConnectionProtocol::Udp,
 //! #    discovery: DiscoveryMethods::Relay,
 //! #    credentials: Credentials {
 //! #        username: "username".to_string(),

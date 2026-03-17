@@ -58,6 +58,11 @@ address = "192.168.1.187:9000"
 # If your device has user connection limits try a single stream instead.
 # stream = "mainStream"
 
+# Baichuan transport used for the camera connection.
+# Udp is the default, Tcp can be used when UDP is unstable, and TcpUdp tries both.
+# If you only configure an address and no uid, NeoLink falls back to Tcp because UDP needs a uid.
+# protocol = "Udp"
+
 # By default neolink will use any means to connect to the camera
 # from a UID
 # This include relaying via reolink servers
