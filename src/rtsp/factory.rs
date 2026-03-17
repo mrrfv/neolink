@@ -736,17 +736,17 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast back"))?;
     let queue = make_queue("source_queue", buffer_size)?;
     let parser = make_element("h264parse", "parser")?;
-    // let stamper = make_element("h264timestamper", "stamper")?;
+    let stamper = make_element("h264timestamper", "stamper")?;
 
-    bin.add_many([&source, &queue, &parser])?;
-    Element::link_many([&source, &queue, &parser])?;
+    bin.add_many([&source, &queue, &parser, &stamper])?;
+    Element::link_many([&source, &queue, &parser, &stamper])?;
 
     let source = source
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot convert appsrc"))?;
     Ok(Linked {
         appsrc: source,
-        output: parser,
+        output: stamper,
     })
 }
 
@@ -795,17 +795,17 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast back"))?;
     let queue = make_queue("source_queue", buffer_size)?;
     let parser = make_element("h265parse", "parser")?;
-    // let stamper = make_element("h265timestamper", "stamper")?;
+    let stamper = make_element("h265timestamper", "stamper")?;
 
-    bin.add_many([&source, &queue, &parser])?;
-    Element::link_many([&source, &queue, &parser])?;
+    bin.add_many([&source, &queue, &parser, &stamper])?;
+    Element::link_many([&source, &queue, &parser, &stamper])?;
 
     let source = source
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot convert appsrc"))?;
     Ok(Linked {
         appsrc: source,
-        output: parser,
+        output: stamper,
     })
 }
 
@@ -1090,6 +1090,8 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
             "adpcmdec" => "Required for audio",
             "h264parse" => "videoparsersbad (gst-plugins-bad)",
             "h265parse" => "videoparsersbad (gst-plugins-bad)",
+            "h264timestamper" => "codectimestamper (gst-plugins-bad)",
+            "h265timestamper" => "codectimestamper (gst-plugins-bad)",
             "rtph264pay" => "rtp (gst-plugins-good)",
             "rtph265pay" => "rtp (gst-plugins-good)",
             "rtpjitterbuffer" => "rtp (gst-plugins-good)",
