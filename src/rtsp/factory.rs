@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
-use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
+use gstreamer_app::{AppLeakyType, AppSrc, AppSrcCallbacks, AppStreamType};
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
@@ -43,7 +43,7 @@ const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// If the camera stops producing packets but never hard-closes the channel,
 /// rebuild the stream rather than letting the client sit on stale media.
-const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Capacity of the per-client media queue.
 ///
@@ -297,6 +297,7 @@ pub(super) async fn make_factory(
         };
 
         let mut clients: Vec<ClientState> = Vec::new();
+        let mut waiting_for_keyframe = false;
 
         loop {
             tokio::select! {
@@ -304,6 +305,20 @@ pub(super) async fn make_factory(
                     match media_opt {
                         Ok(Some(media)) => {
                             stream_config.update_from_media(&media);
+                            if waiting_for_keyframe {
+                                if !is_keyframe(&media) {
+                                    log::debug!(
+                                        "{name}::{stream}: Dropping pre-keyframe media while resyncing"
+                                    );
+                                    continue;
+                                }
+
+                                log::info!(
+                                    "{name}::{stream}: Resynchronized on keyframe after reconnect"
+                                );
+                                waiting_for_keyframe = false;
+                            }
+
                             buffer_media(&mut buffer, media.clone());
 
                             if !clients.is_empty() {
@@ -348,6 +363,8 @@ pub(super) async fn make_factory(
                         }
                         Ok(None) => {
                             log::warn!("{name}::{stream}: Camera stream channel closed, restarting");
+                            waiting_for_keyframe = true;
+                            buffer.clear();
                             media_rx = reopen_stream(&camera, stream, &name).await?;
                         }
                         Err(_) => {
@@ -355,6 +372,8 @@ pub(super) async fn make_factory(
                                 "{name}::{stream}: No media received for {:?}, restarting stream",
                                 STREAM_STALL_TIMEOUT
                             );
+                            waiting_for_keyframe = true;
+                            buffer.clear();
                             media_rx = reopen_stream(&camera, stream, &name).await?;
                         }
                     }
@@ -451,6 +470,7 @@ pub(super) async fn make_factory(
                                 let mut aud_ts: u64 = 0;
                                 let mut pools = Default::default();
 
+                                'sender_loop: {
                                 log::trace!("Sending buffered frames");
                                 for buffered in to_send.drain(..) {
                                     let r = send_to_sources(
@@ -464,24 +484,28 @@ pub(super) async fn make_factory(
                                     );
                                     if let Err(r) = r {
                                         log::info!("Failed to send to source: {r:?}");
+                                        break 'sender_loop;
                                     }
                                 }
 
                                 log::trace!("Sending new frames");
-                                while let Some(data) = rx.blocking_recv() {
-                                    let r = send_to_sources(
-                                        data,
-                                        &mut pools,
-                                        &vid_src,
-                                        &aud_src,
-                                        &mut vid_ts,
-                                        &mut aud_ts,
-                                        &stream_config_clone,
-                                    );
-                                    if let Err(r) = &r {
-                                        log::info!("Failed to send to source: {r:?}");
-                                        break;
+                                while let Some(mut batch) = drain_latest_batch(&mut rx) {
+                                    for data in batch.drain(..) {
+                                        let r = send_to_sources(
+                                            data,
+                                            &mut pools,
+                                            &vid_src,
+                                            &aud_src,
+                                            &mut vid_ts,
+                                            &mut aud_ts,
+                                            &stream_config_clone,
+                                        );
+                                        if let Err(r) = &r {
+                                            log::info!("Failed to send to source: {r:?}");
+                                            break 'sender_loop;
+                                        }
                                     }
+                                }
                                 }
                                 log::trace!("All media received");
                                 AnyResult::Ok(())
@@ -651,6 +675,28 @@ fn send_to_appsrc(
     
     Ok(())
 }
+
+fn drain_latest_batch(rx: &mut tokio::sync::mpsc::Receiver<BcMedia>) -> Option<Vec<BcMedia>> {
+    let first = rx.blocking_recv()?;
+    let mut batch = vec![first];
+    while let Ok(next) = rx.try_recv() {
+        batch.push(next);
+    }
+
+    let keep_from = if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
+        last_iframe
+    } else if batch.len() > 1 {
+        batch.len() - 1
+    } else {
+        0
+    };
+
+    if keep_from > 0 {
+        batch.drain(0..keep_from);
+    }
+
+    Some(batch)
+}
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
     app.pads()
@@ -698,6 +744,7 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_min_latency(1_000_000_000i64 / (stream_config.fps.max(1) as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
+    source.set_leaky_type(AppLeakyType::Downstream);
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
@@ -757,6 +804,7 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_min_latency(1_000_000_000i64 / (stream_config.fps.max(1) as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
+    source.set_leaky_type(AppLeakyType::Downstream);
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
@@ -817,6 +865,7 @@ fn pipe_aac(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> {
     source.set_min_latency(20_000_000);
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
+    source.set_leaky_type(AppLeakyType::Downstream);
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
@@ -904,6 +953,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, _stream_config: &StreamConfig) -> 
     source.set_min_latency(20_000_000);
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
+    source.set_leaky_type(AppLeakyType::Downstream);
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
@@ -978,6 +1028,7 @@ fn pipe_silence(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> 
     source.set_min_latency(20_000_000);
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
+    source.set_leaky_type(AppLeakyType::Downstream);
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
     source.set_stream_type(AppStreamType::Stream);
