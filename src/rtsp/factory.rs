@@ -178,6 +178,13 @@ struct ClientState {
     sender: tokio::sync::mpsc::Sender<BcMedia>,
 }
 
+#[derive(Default)]
+struct TimestampState {
+    next_video_ts: Duration,
+    last_video_source_ts: Option<u32>,
+    next_audio_ts: Duration,
+}
+
 fn buffer_media(buffer: &mut Vec<BcMedia>, media: BcMedia) {
     if matches!(media, BcMedia::Iframe(_)) {
         buffer.clear();
@@ -466,9 +473,7 @@ pub(super) async fn make_factory(
                         std::thread::Builder::new()
                             .name(thread_name)
                             .spawn(move || {
-                                let stream_start = Instant::now();
-                                let mut vid_ts: Duration = Duration::ZERO;
-                                let mut aud_ts: Duration = Duration::ZERO;
+                                let mut timestamps = TimestampState::default();
                                 let mut pools = Default::default();
 
                                 'sender_loop: {
@@ -479,9 +484,7 @@ pub(super) async fn make_factory(
                                         &mut pools,
                                         &vid_src,
                                         &aud_src,
-                                        &mut vid_ts,
-                                        &mut aud_ts,
-                                        stream_start,
+                                        &mut timestamps,
                                         &stream_config_clone,
                                     );
                                     if let Err(r) = r {
@@ -498,9 +501,7 @@ pub(super) async fn make_factory(
                                             &mut pools,
                                             &vid_src,
                                             &aud_src,
-                                            &mut vid_ts,
-                                            &mut aud_ts,
-                                            stream_start,
+                                            &mut timestamps,
                                             &stream_config_clone,
                                         );
                                         if let Err(r) = &r {
@@ -543,9 +544,7 @@ fn send_to_sources(
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut Duration,
-    aud_ts: &mut Duration,
-    stream_start: Instant,
+    timestamps: &mut TimestampState,
     stream_config: &StreamConfig,
 ) -> AnyResult<()> {
     match data {
@@ -553,7 +552,7 @@ fn send_to_sources(
             if let Some(duration) = aac.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
                     let pkt_duration = Duration::from_micros(duration as u64);
-                    let ts = next_timestamp(stream_start.elapsed(), aud_ts, pkt_duration);
+                    let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
                     send_to_appsrc(aud_src, aac.data, ts, Some(pkt_duration), true, false, pools)?;
                 }
             }
@@ -562,24 +561,42 @@ fn send_to_sources(
             if let Some(duration) = adpcm.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
                     let pkt_duration = Duration::from_micros(duration as u64);
-                    let ts = next_timestamp(stream_start.elapsed(), aud_ts, pkt_duration);
+                    let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
                     send_to_appsrc(aud_src, adpcm.data, ts, Some(pkt_duration), true, false, pools)?;
                 }
             }
         }
-        BcMedia::Iframe(BcMediaIframe { data, .. }) => {
+        BcMedia::Iframe(BcMediaIframe {
+            data,
+            microseconds,
+            ..
+        }) => {
             let frame_interval = 1_000_000u64 / u64::from(stream_config.fps.max(1));
             if let Some(vid_src) = vid_src.as_ref() {
                 let pkt_duration = Duration::from_micros(frame_interval);
-                let ts = next_timestamp(stream_start.elapsed(), vid_ts, pkt_duration);
+                let ts = next_video_timestamp(
+                    microseconds,
+                    &mut timestamps.last_video_source_ts,
+                    &mut timestamps.next_video_ts,
+                    pkt_duration,
+                );
                 send_to_appsrc(vid_src, data, ts, Some(pkt_duration), false, true, pools)?;
             }
         }
-        BcMedia::Pframe(BcMediaPframe { data, .. }) => {
+        BcMedia::Pframe(BcMediaPframe {
+            data,
+            microseconds,
+            ..
+        }) => {
             let frame_interval = 1_000_000u64 / u64::from(stream_config.fps.max(1));
             if let Some(vid_src) = vid_src.as_ref() {
                 let pkt_duration = Duration::from_micros(frame_interval);
-                let ts = next_timestamp(stream_start.elapsed(), vid_ts, pkt_duration);
+                let ts = next_video_timestamp(
+                    microseconds,
+                    &mut timestamps.last_video_source_ts,
+                    &mut timestamps.next_video_ts,
+                    pkt_duration,
+                );
                 send_to_appsrc(vid_src, data, ts, Some(pkt_duration), true, true, pools)?;
             }
         }
@@ -588,13 +605,34 @@ fn send_to_sources(
     Ok(())
 }
 
-fn next_timestamp(now: Duration, last: &mut Duration, increment: Duration) -> Duration {
-    let ts = if *last == Duration::ZERO {
-        now
-    } else {
-        now.max(*last + increment)
+fn next_cumulative_timestamp(last: &mut Duration, increment: Duration) -> Duration {
+    let ts = *last;
+    *last = last.saturating_add(increment);
+    ts
+}
+
+fn next_video_timestamp(
+    source_ts: u32,
+    last_source: &mut Option<u32>,
+    next_ts: &mut Duration,
+    fallback_increment: Duration,
+) -> Duration {
+    let ts = *next_ts;
+    let increment = match *last_source {
+        None => fallback_increment,
+        Some(prev) if source_ts > prev => Duration::from_micros((source_ts - prev) as u64),
+        Some(prev) if source_ts == prev => fallback_increment,
+        Some(prev) => {
+            let backward = prev - source_ts;
+            if backward > 1_000_000 {
+                fallback_increment
+            } else {
+                fallback_increment
+            }
+        }
     };
-    *last = ts;
+    *last_source = Some(source_ts);
+    *next_ts = next_ts.saturating_add(increment);
     ts
 }
 
