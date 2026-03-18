@@ -382,46 +382,44 @@ impl Poller {
                                         let threshold = max_capacity / 10; // 10% remaining
 
                                         if capacity == 0 {
-                                            // Message ID 3 carries a byte stream that can span
-                                            // multiple BC packets. Dropping one packet here
-                                            // corrupts downstream frame assembly, so fail fast and
-                                            // reconnect instead of serving damaged media.
                                             warn!(
-                                                "Channel full for msg {} (ID: {}), reconnecting to preserve stream integrity",
-                                                &msg_num, &msg_id
+                                                "OBSERVE: Subscriber saturated for msg {} (ID: {}), dropping subscriber to preserve stream integrity",
+                                                msg_num, msg_id
                                             );
-                                            return Err(Error::DroppedConnection);
+                                            occ.remove(&Some(msg_num));
+                                            continue;
+                                        }
+
+                                        if capacity <= threshold {
+                                            debug!(
+                                                "Channel low: {}/{} for msg {} (ID: {})",
+                                                capacity, max_capacity, &msg_num, &msg_id
+                                            );
                                         } else {
-                                            if capacity <= threshold {
-                                                debug!(
-                                                    "Channel low: {}/{} for msg {} (ID: {})",
-                                                    capacity, max_capacity, &msg_num, &msg_id
+                                            trace!(
+                                                "Channel: {}/{} for msg {} (ID: {})",
+                                                capacity,
+                                                max_capacity,
+                                                &msg_num,
+                                                &msg_id
+                                            );
+                                        }
+
+                                        match sender.try_send(Ok(response)) {
+                                            Ok(()) => {}
+                                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                warn!(
+                                                    "OBSERVE: Subscriber full for msg {} (ID: {}), dropping subscriber to avoid backpressure",
+                                                    msg_num, msg_id
                                                 );
-                                            } else {
-                                                trace!(
-                                                    "Channel: {}/{} for msg {} (ID: {})",
-                                                    capacity,
-                                                    max_capacity,
-                                                    &msg_num,
-                                                    &msg_id
-                                                );
+                                                occ.remove(&Some(msg_num));
                                             }
-                                            match sender.try_send(Ok(response)) {
-                                                Ok(()) => {}
-                                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                                    warn!(
-                                                        "Subscriber full for msg {} (ID: {}), dropping subscriber to avoid backpressure",
-                                                        msg_num, msg_id
-                                                    );
-                                                    occ.remove(&Some(msg_num));
-                                                }
-                                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                                    warn!(
-                                                        "Subscriber closed for msg {} (ID: {}), dropping subscriber",
-                                                        msg_num, msg_id
-                                                    );
-                                                    occ.remove(&Some(msg_num));
-                                                }
+                                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                warn!(
+                                                    "Subscriber closed for msg {} (ID: {}), dropping subscriber",
+                                                    msg_num, msg_id
+                                                );
+                                                occ.remove(&Some(msg_num));
                                             }
                                         }
                                     } else {

@@ -150,10 +150,15 @@ impl NeoInstance {
                                 while let Some(media) = stream.recv().await {
                                     if let Err(err) = media_tx.try_send(media) {
                                         match err {
-                                            TrySendError::Full(_) => {
-                                                log::debug!(
-                                                    "{name}::{stream:?}: Dropping media frame while RTSP is behind"
-                                                );
+                                            TrySendError::Full(m) => {
+                                                let media_type = match &m {
+                                                    BcMedia::Iframe(_) => "Iframe",
+                                                    BcMedia::Pframe(_) => "Pframe",
+                                                    BcMedia::Aac(_) => "Aac",
+                                                    BcMedia::Adpcm(_) => "Adpcm",
+                                                    _ => "Other",
+                                                };
+                                                log::warn!("OBSERVE: Queue-full drop stream={:?} media={}", stream, media_type);
                                             }
                                             TrySendError::Closed(_) => {
                                                 return AnyResult::Ok(());
@@ -208,8 +213,15 @@ impl NeoInstance {
                                 Ok(Ok(media)) => {
                                     match media_tx.try_send(media) {
                                         Ok(()) => {}
-                                        Err(TrySendError::Full(_)) => {
-                                            log::trace!("Stream queue full, dropping media");
+                                        Err(TrySendError::Full(m)) => {
+                                            let media_type = match &m {
+                                                BcMedia::Iframe(_) => "Iframe",
+                                                BcMedia::Pframe(_) => "Pframe",
+                                                BcMedia::Aac(_) => "Aac",
+                                                BcMedia::Adpcm(_) => "Adpcm",
+                                                _ => "Other",
+                                            };
+                                            log::warn!("OBSERVE: Queue-full drop stream={:?} media={}", stream, media_type);
                                         }
                                         Err(TrySendError::Closed(_)) => {
                                             log::trace!("Stream consumer dropped");

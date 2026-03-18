@@ -351,18 +351,26 @@ pub(super) async fn make_factory(
                                             still_open.push(client);
                                         }
                                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            let media_type = match &media {
+                                                BcMedia::Iframe(_) => "Iframe",
+                                                BcMedia::Pframe(_) => "Pframe",
+                                                BcMedia::Aac(_) => "Aac",
+                                                BcMedia::Adpcm(_) => "Adpcm",
+                                                _ => "Other",
+                                            };
                                             if drop_ok {
                                                 log::debug!(
-                                                    "{name}::{stream}: Dropping media frame for one RTSP client under backpressure"
+                                                    "OBSERVE: Queue-full drop stream={} media={} (Client Fanout)", stream, media_type
                                                 );
                                                 still_open.push(client);
                                             } else if is_keyframe(&media) {
                                                 log::warn!(
-                                                    "{name}::{stream}: Dropping RTSP client because a keyframe could not be queued"
+                                                    "OBSERVE: Queue-full drop stream={} media={} (Client Fanout). Dropping keyframe but keeping client.", stream, media_type
                                                 );
+                                                still_open.push(client);
                                             } else {
                                                 log::warn!(
-                                                    "{name}::{stream}: Backpressure on non-droppable media, keeping RTSP client"
+                                                    "OBSERVE: Queue-full drop stream={} media={} (Client Fanout). Backpressure on non-droppable.", stream, media_type
                                                 );
                                                 still_open.push(client);
                                             }
@@ -491,7 +499,7 @@ pub(super) async fn make_factory(
                                 let mut pools = Default::default();
                                 let mut waiting_for_keyframe = bootstrap_needs_keyframe;
 
-                                if let Err(e) = wait_for_sources_ready(&vid_src, &aud_src) {
+                                if let Err(e) = wait_for_sources_ready(&vid_src, &aud_src, &name, &stream.to_string()) {
                                     log::warn!(
                                         "{name}::{stream}: RTSP pipeline did not become live in time: {e:?}"
                                     );
@@ -501,8 +509,13 @@ pub(super) async fn make_factory(
                                 'sender_loop: {
                                     log::trace!("Sending buffered frames");
                                     for buffered in to_send.drain(..) {
-                                        if waiting_for_keyframe && !is_keyframe(&buffered) {
-                                            continue;
+                                        if waiting_for_keyframe {
+                                            if !is_keyframe(&buffered) {
+                                                continue;
+                                            }
+                                            log::info!("OBSERVE: RTSP client resynchronized on keyframe, resetting timing");
+                                            timestamps.last_video_source_ts = None;
+                                            waiting_for_keyframe = false;
                                         }
 
                                         match send_to_sources(
@@ -513,11 +526,7 @@ pub(super) async fn make_factory(
                                             &mut timestamps,
                                             &stream_config_clone,
                                         ) {
-                                            Ok(FrameSendOutcome::Sent) => {
-                                                if waiting_for_keyframe {
-                                                    waiting_for_keyframe = false;
-                                                }
-                                            }
+                                            Ok(FrameSendOutcome::Sent) => {}
                                             Ok(FrameSendOutcome::DroppedVideo) => {
                                                 waiting_for_keyframe = true;
                                             }
@@ -531,8 +540,13 @@ pub(super) async fn make_factory(
                                     log::trace!("Sending new frames");
                                 while let Some(mut batch) = drain_latest_batch(&mut rx) {
                                     for data in batch.drain(..) {
-                                        if waiting_for_keyframe && !is_keyframe(&data) {
-                                            continue;
+                                        if waiting_for_keyframe {
+                                            if !is_keyframe(&data) {
+                                                continue;
+                                            }
+                                            log::info!("OBSERVE: RTSP client resynchronized on keyframe, resetting timing");
+                                            timestamps.last_video_source_ts = None;
+                                            waiting_for_keyframe = false;
                                         }
 
                                             match send_to_sources(
@@ -543,11 +557,7 @@ pub(super) async fn make_factory(
                                                 &mut timestamps,
                                                 &stream_config_clone,
                                             ) {
-                                                Ok(FrameSendOutcome::Sent) => {
-                                                    if waiting_for_keyframe {
-                                                        waiting_for_keyframe = false;
-                                                    }
-                                                }
+                                                Ok(FrameSendOutcome::Sent) => {}
                                                 Ok(FrameSendOutcome::DroppedVideo) => {
                                                     waiting_for_keyframe = true;
                                                 }
@@ -688,8 +698,8 @@ fn next_video_timestamp(
             fallback_increment
         }
         Some(prev) if prev >= u32::MAX - VIDEO_TIMESTAMP_WRAP_WINDOW && source_ts <= VIDEO_TIMESTAMP_WRAP_WINDOW => {
-            log::debug!(
-                "RTSP video timestamp wrapped: source={} prev={}",
+            log::info!(
+                "OBSERVE: Timestamp wrap event source={} prev={}",
                 source_ts,
                 prev
             );
@@ -699,7 +709,7 @@ fn next_video_timestamp(
             // Camera restart or timestamp reset. Keep the RTSP clock monotonic and
             // fall back to the expected frame cadence instead of replaying an old source delta.
             log::warn!(
-                "RTSP video timestamp reset/backward jump detected: source={} prev={}",
+                "OBSERVE: Timestamp reset/backward jump detected: source={} prev={}",
                 source_ts,
                 last_source.unwrap_or_default()
             );
@@ -852,29 +862,36 @@ fn check_live(app: &AppSrc) -> Result<()> {
         .ok_or(anyhow!("App source is not linked"))
 }
 
-fn wait_for_sources_ready(vid_src: &Option<AppSrc>, aud_src: &Option<AppSrc>) -> Result<()> {
-    let start = Instant::now();
+fn wait_for_sources_ready(vid_src: &Option<AppSrc>, aud_src: &Option<AppSrc>, name: &str, stream: &str) -> Result<()> {
+    let mut start = Instant::now();
+    let mut retries = 0;
 
     loop {
-        let video_ready = vid_src.as_ref().map_or(true, |src| check_live(src).is_ok());
-        let audio_ready = aud_src.as_ref().map_or(true, |src| check_live(src).is_ok());
+        let video_ready = vid_src.as_ref().map_or(Ok(true), check_live_ready);
+        let audio_ready = aud_src.as_ref().map_or(Ok(true), check_live_ready);
 
-        if video_ready && audio_ready {
-            return Ok(());
+        match (video_ready, audio_ready) {
+            (Ok(true), Ok(true)) => return Ok(()),
+            (Err(e), _) | (_, Err(e)) => {
+                log::error!("OBSERVE: Appsrc readiness failure for {}::{}: {:?}", name, stream, e);
+                return Err(e);
+            }
+            _ => {}
         }
 
         if start.elapsed() >= SOURCE_READY_TIMEOUT {
-            if let Some(src) = vid_src.as_ref() {
-                check_live(src)?;
-            }
-            if let Some(src) = aud_src.as_ref() {
-                check_live(src)?;
-            }
-            return Ok(());
+            retries += 1;
+            log::info!("OBSERVE: RTSP client startup retry {} for {}::{}", retries, name, stream);
+            start = Instant::now(); // Reset to wait again
         }
 
         std::thread::sleep(SOURCE_READY_POLL);
     }
+}
+
+fn check_live_ready(app: &AppSrc) -> Result<bool> {
+    app.bus().ok_or_else(|| anyhow!("App source is closed"))?;
+    Ok(app.pads().iter().all(|pad| pad.is_linked()))
 }
 
 fn clear_bin(bin: &Element) -> Result<()> {
@@ -1052,36 +1069,10 @@ fn pipe_aac(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> {
         Err(_) => make_element("avdec_aac", "auddecoder_avdec_aac"),
     }?;
 
-    // The fallback
-    let silence = make_element("audiotestsrc", "audsilence")?;
-    silence.set_property_from_str("wave", "silence");
-    // Keep the fallback source live so audio timestamps stay monotonic when we
-    // switch over during camera stalls.
-    silence.set_property("is-live", true);
-    silence.set_property("do-timestamp", true);
-    let fallback_switch = make_element("fallbackswitch", "audfallbackswitch");
-    if let Ok(fallback_switch) = fallback_switch.as_ref() {
-        fallback_switch.set_property("timeout", 3u64 * 1_000_000_000u64);
-        fallback_switch.set_property("immediate-fallback", true);
-    }
-
     let encoder = make_element("audioconvert", "audencoder")?;
 
     bin.add_many([&source, &queue, &parser, &decoder, &encoder])?;
-    if let Ok(fallback_switch) = fallback_switch.as_ref() {
-        bin.add_many([&silence, fallback_switch])?;
-        Element::link_many([
-            &source,
-            &queue,
-            &parser,
-            &decoder,
-            fallback_switch,
-            &encoder,
-        ])?;
-        Element::link_many([&silence, fallback_switch])?;
-    } else {
-        Element::link_many([&source, &queue, &parser, &decoder, &encoder])?;
-    }
+    Element::link_many([&source, &queue, &parser, &decoder, &encoder])?;
 
     let source = source
         .dynamic_cast::<AppSrc>()
