@@ -148,7 +148,18 @@ impl NeoInstance {
                                 let mut stream = thread_camera.stream(stream).await?;
                                 log::debug!("Got stream");
                                 while let Some(media) = stream.recv().await {
-                                    media_tx.send(media).await?;
+                                    if let Err(err) = media_tx.try_send(media) {
+                                        match err {
+                                            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                                log::debug!(
+                                                    "{name}::{stream:?}: Dropping media frame while RTSP is behind"
+                                                );
+                                            }
+                                            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                                return AnyResult::Ok(());
+                                            }
+                                        }
+                                    }
                                 }
                                 AnyResult::Ok(())
                             } => {
@@ -195,9 +206,15 @@ impl NeoInstance {
                         loop {
                             match media_stream.get_data().await {
                                 Ok(Ok(media)) => {
-                                    if media_tx.send(media).await.is_err() {
-                                        log::trace!("Stream consumer dropped");
-                                        return AnyResult::Ok(());
+                                    match media_tx.try_send(media) {
+                                        Ok(()) => {}
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            log::trace!("Stream queue full, dropping media");
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            log::trace!("Stream consumer dropped");
+                                            return AnyResult::Ok(());
+                                        }
                                     }
                                 }
                                 Ok(Err(e)) => {

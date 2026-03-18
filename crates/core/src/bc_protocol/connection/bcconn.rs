@@ -406,11 +406,22 @@ impl Poller {
                                                     &msg_id
                                                 );
                                             }
-                                            if let Err(e) = sender.send(Ok(response)).await {
-                                                warn!(
-                                                    "Frame dropped for msg {} (ID: {}): {}",
-                                                    msg_num, msg_id, e
-                                                );
+                                            match sender.try_send(Ok(response)) {
+                                                Ok(()) => {}
+                                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                    warn!(
+                                                        "Subscriber full for msg {} (ID: {}), dropping subscriber to avoid backpressure",
+                                                        msg_num, msg_id
+                                                    );
+                                                    occ.remove(&Some(msg_num));
+                                                }
+                                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                    warn!(
+                                                        "Subscriber closed for msg {} (ID: {}), dropping subscriber",
+                                                        msg_num, msg_id
+                                                    );
+                                                    occ.remove(&Some(msg_num));
+                                                }
                                             }
                                         }
                                     } else {
