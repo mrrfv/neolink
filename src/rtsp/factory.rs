@@ -44,6 +44,7 @@ const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// If the camera stops producing packets but never hard-closes the channel,
 /// rebuild the stream rather than letting the client sit on stale media.
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const VIDEO_TIMESTAMP_WRAP_WINDOW: u32 = 5_000_000;
 
 /// Capacity of the per-client media queue.
 ///
@@ -622,13 +623,13 @@ fn next_video_timestamp(
         None => fallback_increment,
         Some(prev) if source_ts > prev => Duration::from_micros((source_ts - prev) as u64),
         Some(prev) if source_ts == prev => fallback_increment,
-        Some(prev) => {
-            let backward = prev - source_ts;
-            if backward > 1_000_000 {
-                fallback_increment
-            } else {
-                fallback_increment
-            }
+        Some(prev) if prev >= u32::MAX - VIDEO_TIMESTAMP_WRAP_WINDOW && source_ts <= VIDEO_TIMESTAMP_WRAP_WINDOW => {
+            Duration::from_micros(source_ts.wrapping_sub(prev) as u64)
+        }
+        Some(_) => {
+            // Camera restart or timestamp reset. Keep the RTSP clock monotonic and
+            // fall back to the expected frame cadence instead of replaying an old source delta.
+            fallback_increment
         }
     };
     *last_source = Some(source_ts);
@@ -1407,5 +1408,19 @@ mod tests {
             one_year_microseconds < u64::MAX,
             "Timestamp would overflow within 1 year"
         );
+    }
+
+    #[test]
+    fn test_video_timestamp_wraps_monotonically() {
+        let mut last_source = Some(u32::MAX - 10);
+        let mut next_ts = Duration::from_secs(10);
+        let frame = Duration::from_micros(33_333);
+
+        let first = next_video_timestamp(u32::MAX - 5, &mut last_source, &mut next_ts, frame);
+        let second = next_video_timestamp(3, &mut last_source, &mut next_ts, frame);
+
+        assert_eq!(first, Duration::from_secs(10));
+        assert_eq!(second, Duration::from_secs(10) + Duration::from_micros(5));
+        assert!(next_ts > second);
     }
 }
