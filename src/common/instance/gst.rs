@@ -3,7 +3,7 @@ use super::*;
 use crate::common::UseCounter;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia, Error as CoreError};
-use tokio::sync::mpsc::Receiver as MpscReceiver;
+use tokio::sync::mpsc::{error::TrySendError, Receiver as MpscReceiver};
 
 #[cfg(feature = "pushnoti")]
 use crate::common::PushNoti;
@@ -150,12 +150,12 @@ impl NeoInstance {
                                 while let Some(media) = stream.recv().await {
                                     if let Err(err) = media_tx.try_send(media) {
                                         match err {
-                                            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                            TrySendError::Full(_) => {
                                                 log::debug!(
                                                     "{name}::{stream:?}: Dropping media frame while RTSP is behind"
                                                 );
                                             }
-                                            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                            TrySendError::Closed(_) => {
                                                 return AnyResult::Ok(());
                                             }
                                         }
@@ -208,10 +208,10 @@ impl NeoInstance {
                                 Ok(Ok(media)) => {
                                     match media_tx.try_send(media) {
                                         Ok(()) => {}
-                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        Err(TrySendError::Full(_)) => {
                                             log::trace!("Stream queue full, dropping media");
                                         }
-                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        Err(TrySendError::Closed(_)) => {
                                             log::trace!("Stream consumer dropped");
                                             return AnyResult::Ok(());
                                         }
