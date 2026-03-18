@@ -622,13 +622,30 @@ fn next_video_timestamp(
     let increment = match *last_source {
         None => fallback_increment,
         Some(prev) if source_ts > prev => Duration::from_micros((source_ts - prev) as u64),
-        Some(prev) if source_ts == prev => fallback_increment,
+        Some(prev) if source_ts == prev => {
+            log::debug!(
+                "RTSP video timestamp repeated: source={} prev={}, using fallback increment",
+                source_ts,
+                prev
+            );
+            fallback_increment
+        }
         Some(prev) if prev >= u32::MAX - VIDEO_TIMESTAMP_WRAP_WINDOW && source_ts <= VIDEO_TIMESTAMP_WRAP_WINDOW => {
+            log::debug!(
+                "RTSP video timestamp wrapped: source={} prev={}",
+                source_ts,
+                prev
+            );
             Duration::from_micros(source_ts.wrapping_sub(prev) as u64)
         }
         Some(_) => {
             // Camera restart or timestamp reset. Keep the RTSP clock monotonic and
             // fall back to the expected frame cadence instead of replaying an old source delta.
+            log::warn!(
+                "RTSP video timestamp reset/backward jump detected: source={} prev={}",
+                source_ts,
+                last_source.unwrap_or_default()
+            );
             fallback_increment
         }
     };
