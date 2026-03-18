@@ -44,6 +44,10 @@ const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// If the camera stops producing packets but never hard-closes the channel,
 /// rebuild the stream rather than letting the client sit on stale media.
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time to wait for a newly created RTSP client pipeline to become live.
+const SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Poll interval while waiting for the RTSP client pipeline to become live.
+const SOURCE_READY_POLL: Duration = Duration::from_millis(20);
 const VIDEO_TIMESTAMP_WRAP_WINDOW: u32 = 5_000_000;
 
 /// Capacity of the per-client media queue.
@@ -476,14 +480,23 @@ pub(super) async fn make_factory(
                         let mut to_send = buffer.clone();
                         let bootstrap_needs_keyframe = prepare_bootstrap_batch(&mut to_send);
 
-                        let thread_name = format!("{name}::{stream}::sender");
+                        let sender_name = name.clone();
+                        let thread_name = format!("{sender_name}::{stream}::sender");
                         let stream_config_clone = stream_config.clone();
                         std::thread::Builder::new()
                             .name(thread_name)
                             .spawn(move || {
+                                let name = sender_name;
                                 let mut timestamps = TimestampState::default();
                                 let mut pools = Default::default();
                                 let mut waiting_for_keyframe = bootstrap_needs_keyframe;
+
+                                if let Err(e) = wait_for_sources_ready(&vid_src, &aud_src) {
+                                    log::warn!(
+                                        "{name}::{stream}: RTSP pipeline did not become live in time: {e:?}"
+                                    );
+                                    return AnyResult::Err(e);
+                                }
 
                                 'sender_loop: {
                                     log::trace!("Sending buffered frames");
@@ -647,6 +660,11 @@ fn send_to_sources(
 
 fn next_cumulative_timestamp(last: &mut Duration, increment: Duration) -> Duration {
     let ts = *last;
+    let increment = if increment.is_zero() {
+        Duration::from_micros(1)
+    } else {
+        increment
+    };
     *last = last.saturating_add(increment);
     ts
 }
@@ -798,7 +816,7 @@ fn drain_latest_batch(
             let _ = batch.drain(0..last_iframe);
         }
     } else if batch.len() > 1 {
-        log::debug!(
+        log::trace!(
             "Drained RTSP batch without a keyframe; keeping latest media to avoid stalls"
         );
     }
@@ -813,7 +831,7 @@ fn prepare_bootstrap_batch(batch: &mut Vec<BcMedia>) -> bool {
         }
         false
     } else if batch.len() > 1 {
-        log::debug!(
+        log::trace!(
             "Trimming RTSP bootstrap without a keyframe to avoid startup lag"
         );
         if let Some(last) = batch.pop() {
@@ -832,6 +850,31 @@ fn check_live(app: &AppSrc) -> Result<()> {
         .all(|pad| pad.is_linked())
         .then_some(())
         .ok_or(anyhow!("App source is not linked"))
+}
+
+fn wait_for_sources_ready(vid_src: &Option<AppSrc>, aud_src: &Option<AppSrc>) -> Result<()> {
+    let start = Instant::now();
+
+    loop {
+        let video_ready = vid_src.as_ref().map_or(true, |src| check_live(src).is_ok());
+        let audio_ready = aud_src.as_ref().map_or(true, |src| check_live(src).is_ok());
+
+        if video_ready && audio_ready {
+            return Ok(());
+        }
+
+        if start.elapsed() >= SOURCE_READY_TIMEOUT {
+            if let Some(src) = vid_src.as_ref() {
+                check_live(src)?;
+            }
+            if let Some(src) = aud_src.as_ref() {
+                check_live(src)?;
+            }
+            return Ok(());
+        }
+
+        std::thread::sleep(SOURCE_READY_POLL);
+    }
 }
 
 fn clear_bin(bin: &Element) -> Result<()> {
@@ -1012,6 +1055,10 @@ fn pipe_aac(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> {
     // The fallback
     let silence = make_element("audiotestsrc", "audsilence")?;
     silence.set_property_from_str("wave", "silence");
+    // Keep the fallback source live so audio timestamps stay monotonic when we
+    // switch over during camera stalls.
+    silence.set_property("is-live", true);
+    silence.set_property("do-timestamp", true);
     let fallback_switch = make_element("fallbackswitch", "audfallbackswitch");
     if let Ok(fallback_switch) = fallback_switch.as_ref() {
         fallback_switch.set_property("timeout", 3u64 * 1_000_000_000u64);
@@ -1170,6 +1217,8 @@ fn pipe_silence(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> 
 
     let silence = make_element("audiotestsrc", "audsilence")?;
     silence.set_property_from_str("wave", "silence");
+    silence.set_property("is-live", true);
+    silence.set_property("do-timestamp", true);
     let src_queue = make_queue("audsinkqueue", buffer_size)?;
     let encoder = make_element("audioconvert", "audencoder")?;
 
@@ -1515,6 +1564,16 @@ mod tests {
         assert_eq!(first, Duration::from_secs(10));
         assert_eq!(second, Duration::from_secs(10) + Duration::from_micros(5));
         assert!(next_ts > second);
+    }
+
+    #[test]
+    fn test_audio_timestamp_never_stalls_on_zero_increment() {
+        let mut next_ts = Duration::from_micros(0);
+        let first = next_cumulative_timestamp(&mut next_ts, Duration::from_micros(0));
+        let second = next_cumulative_timestamp(&mut next_ts, Duration::from_micros(0));
+
+        assert!(second > first);
+        assert_eq!(second, Duration::from_micros(1));
     }
 
     #[test]
