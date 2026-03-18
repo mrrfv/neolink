@@ -474,6 +474,7 @@ pub(super) async fn make_factory(
                         clients.push(ClientState { sender: tx });
 
                         let mut to_send = buffer.clone();
+                        let bootstrap_needs_keyframe = prepare_bootstrap_batch(&mut to_send);
 
                         let thread_name = format!("{name}::{stream}::sender");
                         let stream_config_clone = stream_config.clone();
@@ -482,7 +483,7 @@ pub(super) async fn make_factory(
                             .spawn(move || {
                                 let mut timestamps = TimestampState::default();
                                 let mut pools = Default::default();
-                                let mut waiting_for_keyframe = false;
+                                let mut waiting_for_keyframe = bootstrap_needs_keyframe;
 
                                 'sender_loop: {
                                     log::trace!("Sending buffered frames");
@@ -515,11 +516,7 @@ pub(super) async fn make_factory(
                                     }
 
                                     log::trace!("Sending new frames");
-                                while let Some((mut batch, needs_keyframe)) = drain_latest_batch(&mut rx) {
-                                    if needs_keyframe {
-                                        waiting_for_keyframe = true;
-                                    }
-
+                                while let Some(mut batch) = drain_latest_batch(&mut rx) {
                                     for data in batch.drain(..) {
                                         if waiting_for_keyframe && !is_keyframe(&data) {
                                             continue;
@@ -789,33 +786,44 @@ fn send_to_appsrc(
 
 fn drain_latest_batch(
     rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
-) -> Option<(Vec<BcMedia>, bool)> {
+) -> Option<Vec<BcMedia>> {
     let first = rx.blocking_recv()?;
     let mut batch = vec![first];
     while let Ok(next) = rx.try_recv() {
         batch.push(next);
     }
 
-    let needs_keyframe = if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
+    if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
+        if last_iframe > 0 {
+            let _ = batch.drain(0..last_iframe);
+        }
+    } else if batch.len() > 1 {
+        log::debug!(
+            "Drained RTSP batch without a keyframe; keeping latest media to avoid stalls"
+        );
+    }
+
+    Some(batch)
+}
+
+fn prepare_bootstrap_batch(batch: &mut Vec<BcMedia>) -> bool {
+    if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
         if last_iframe > 0 {
             let _ = batch.drain(0..last_iframe);
         }
         false
     } else if batch.len() > 1 {
         log::debug!(
-            "Dropping drained RTSP batch without a keyframe to preserve decoder state"
+            "Trimming RTSP bootstrap without a keyframe to avoid startup lag"
         );
-        batch.clear();
+        if let Some(last) = batch.pop() {
+            batch.clear();
+            batch.push(last);
+        }
         true
     } else {
         false
-    };
-
-    if batch.is_empty() {
-        return Some((batch, needs_keyframe));
     }
-
-    Some((batch, needs_keyframe))
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
@@ -1335,6 +1343,23 @@ fn buffer_size(bitrate: u32) -> u32 {
 mod tests {
     use super::*;
 
+    fn sample_iframe() -> BcMedia {
+        BcMedia::Iframe(BcMediaIframe {
+            video_type: VideoType::H264,
+            microseconds: 1,
+            time: None,
+            data: vec![1, 2, 3, 4],
+        })
+    }
+
+    fn sample_pframe() -> BcMedia {
+        BcMedia::Pframe(BcMediaPframe {
+            video_type: VideoType::H264,
+            microseconds: 2,
+            data: vec![5, 6, 7, 8],
+        })
+    }
+
     /// Verify audio buffer size is reasonable
     #[test]
     fn test_audio_buffer_size() {
@@ -1490,5 +1515,53 @@ mod tests {
         assert_eq!(first, Duration::from_secs(10));
         assert_eq!(second, Duration::from_secs(10) + Duration::from_micros(5));
         assert!(next_ts > second);
+    }
+
+    #[test]
+    fn test_drain_latest_batch_preserves_media_without_keyframe() {
+        let mut batch = vec![sample_pframe(), sample_pframe(), sample_pframe()];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        for media in batch.drain(..) {
+            tx.try_send(media).unwrap();
+        }
+
+        let drained = drain_latest_batch(&mut rx).expect("expected batch");
+        assert_eq!(drained.len(), 3);
+        assert!(matches!(drained.first(), Some(BcMedia::Pframe(_))));
+        assert!(matches!(drained.last(), Some(BcMedia::Pframe(_))));
+    }
+
+    #[test]
+    fn test_drain_latest_batch_trims_prekeyframes() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.try_send(sample_pframe()).unwrap();
+        tx.try_send(sample_pframe()).unwrap();
+        tx.try_send(sample_iframe()).unwrap();
+        tx.try_send(sample_pframe()).unwrap();
+
+        let drained = drain_latest_batch(&mut rx).expect("expected batch");
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(drained.first(), Some(BcMedia::Iframe(_))));
+        assert!(matches!(drained.last(), Some(BcMedia::Pframe(_))));
+    }
+
+    #[test]
+    fn test_prepare_bootstrap_batch_trims_to_latest_keyframe() {
+        let mut batch = vec![sample_pframe(), sample_pframe(), sample_iframe(), sample_pframe()];
+        let needs_keyframe = prepare_bootstrap_batch(&mut batch);
+
+        assert!(!needs_keyframe);
+        assert_eq!(batch.len(), 2);
+        assert!(matches!(batch.first(), Some(BcMedia::Iframe(_))));
+    }
+
+    #[test]
+    fn test_prepare_bootstrap_batch_limits_lag_without_keyframe() {
+        let mut batch = vec![sample_pframe(), sample_pframe(), sample_pframe()];
+        let needs_keyframe = prepare_bootstrap_batch(&mut batch);
+
+        assert!(needs_keyframe);
+        assert_eq!(batch.len(), 1);
+        assert!(matches!(batch.first(), Some(BcMedia::Pframe(_))));
     }
 }

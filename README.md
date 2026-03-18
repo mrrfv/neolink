@@ -9,10 +9,10 @@ I forked [joshkautz's neolink fork](https://github.com/joshkautz/neolink) as an 
 
 Changes:
 
-- Refactored discovery mechanism to prioritize direct paths over relays
-- Fixed stream handle generation to use unique per-session handles
-- Refactor of media factory system
-- Implemented an automatic retry mechanism for failed camera tasks
+- Discovery now prefers direct camera paths and falls back cleanly through UDP/local discovery when needed
+- RTSP paths are exposed immediately at startup, with unique per-session stream handles
+- RTSP timing is monotonic, keyframe-aware, and drops stale backlog under backpressure for lower latency
+- Camera transport is configurable with `protocol = "Udp" | "Tcp" | "TcpUdp"` and defaults to UDP
 
 ---
 
