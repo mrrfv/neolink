@@ -186,6 +186,12 @@ struct TimestampState {
     next_audio_ts: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameSendOutcome {
+    Sent,
+    DroppedVideo,
+}
+
 fn buffer_media(buffer: &mut Vec<BcMedia>, media: BcMedia) {
     if matches!(media, BcMedia::Iframe(_)) {
         buffer.clear();
@@ -476,41 +482,72 @@ pub(super) async fn make_factory(
                             .spawn(move || {
                                 let mut timestamps = TimestampState::default();
                                 let mut pools = Default::default();
+                                let mut waiting_for_keyframe = false;
 
                                 'sender_loop: {
-                                log::trace!("Sending buffered frames");
-                                for buffered in to_send.drain(..) {
-                                    let r = send_to_sources(
-                                        buffered,
-                                        &mut pools,
-                                        &vid_src,
-                                        &aud_src,
-                                        &mut timestamps,
-                                        &stream_config_clone,
-                                    );
-                                    if let Err(r) = r {
-                                        log::info!("Failed to send to source: {r:?}");
-                                        break 'sender_loop;
-                                    }
-                                }
+                                    log::trace!("Sending buffered frames");
+                                    for buffered in to_send.drain(..) {
+                                        if waiting_for_keyframe && !is_keyframe(&buffered) {
+                                            continue;
+                                        }
 
-                                log::trace!("Sending new frames");
-                                while let Some(mut batch) = drain_latest_batch(&mut rx) {
-                                    for data in batch.drain(..) {
-                                        let r = send_to_sources(
-                                            data,
+                                        match send_to_sources(
+                                            buffered,
                                             &mut pools,
                                             &vid_src,
                                             &aud_src,
                                             &mut timestamps,
                                             &stream_config_clone,
-                                        );
-                                        if let Err(r) = &r {
-                                            log::info!("Failed to send to source: {r:?}");
-                                            break 'sender_loop;
+                                        ) {
+                                            Ok(FrameSendOutcome::Sent) => {
+                                                if waiting_for_keyframe {
+                                                    waiting_for_keyframe = false;
+                                                }
+                                            }
+                                            Ok(FrameSendOutcome::DroppedVideo) => {
+                                                waiting_for_keyframe = true;
+                                            }
+                                            Err(r) => {
+                                                log::info!("Failed to send to source: {r:?}");
+                                                break 'sender_loop;
+                                            }
                                         }
                                     }
-                                }
+
+                                    log::trace!("Sending new frames");
+                                while let Some((mut batch, needs_keyframe)) = drain_latest_batch(&mut rx) {
+                                    if needs_keyframe {
+                                        waiting_for_keyframe = true;
+                                    }
+
+                                    for data in batch.drain(..) {
+                                        if waiting_for_keyframe && !is_keyframe(&data) {
+                                            continue;
+                                        }
+
+                                            match send_to_sources(
+                                                data,
+                                                &mut pools,
+                                                &vid_src,
+                                                &aud_src,
+                                                &mut timestamps,
+                                                &stream_config_clone,
+                                            ) {
+                                                Ok(FrameSendOutcome::Sent) => {
+                                                    if waiting_for_keyframe {
+                                                        waiting_for_keyframe = false;
+                                                    }
+                                                }
+                                                Ok(FrameSendOutcome::DroppedVideo) => {
+                                                    waiting_for_keyframe = true;
+                                                }
+                                                Err(r) => {
+                                                    log::info!("Failed to send to source: {r:?}");
+                                                    break 'sender_loop;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 log::trace!("All media received");
                                 AnyResult::Ok(())
@@ -547,25 +584,27 @@ fn send_to_sources(
     aud_src: &Option<AppSrc>,
     timestamps: &mut TimestampState,
     stream_config: &StreamConfig,
-) -> AnyResult<()> {
+) -> AnyResult<FrameSendOutcome> {
     match data {
         BcMedia::Aac(aac) => {
             if let Some(duration) = aac.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
                     let pkt_duration = Duration::from_micros(duration as u64);
                     let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
-                    send_to_appsrc(aud_src, aac.data, ts, Some(pkt_duration), true, false, pools)?;
+                    let _ = send_to_appsrc(aud_src, aac.data, ts, Some(pkt_duration), true, false, pools)?;
                 }
             }
+            Ok(FrameSendOutcome::Sent)
         }
         BcMedia::Adpcm(adpcm) => {
             if let Some(duration) = adpcm.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
                     let pkt_duration = Duration::from_micros(duration as u64);
                     let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
-                    send_to_appsrc(aud_src, adpcm.data, ts, Some(pkt_duration), true, false, pools)?;
+                    let _ = send_to_appsrc(aud_src, adpcm.data, ts, Some(pkt_duration), true, false, pools)?;
                 }
             }
+            Ok(FrameSendOutcome::Sent)
         }
         BcMedia::Iframe(BcMediaIframe {
             data,
@@ -581,8 +620,9 @@ fn send_to_sources(
                     &mut timestamps.next_video_ts,
                     pkt_duration,
                 );
-                send_to_appsrc(vid_src, data, ts, Some(pkt_duration), false, true, pools)?;
+                let _ = send_to_appsrc(vid_src, data, ts, Some(pkt_duration), false, true, pools)?;
             }
+            Ok(FrameSendOutcome::Sent)
         }
         BcMedia::Pframe(BcMediaPframe {
             data,
@@ -598,12 +638,14 @@ fn send_to_sources(
                     &mut timestamps.next_video_ts,
                     pkt_duration,
                 );
-                send_to_appsrc(vid_src, data, ts, Some(pkt_duration), true, true, pools)?;
+                if !send_to_appsrc(vid_src, data, ts, Some(pkt_duration), true, true, pools)? {
+                    return Ok(FrameSendOutcome::DroppedVideo);
+                }
             }
+            Ok(FrameSendOutcome::Sent)
         }
-        _ => {}
+        _ => Ok(FrameSendOutcome::Sent),
     }
-    Ok(())
 }
 
 fn next_cumulative_timestamp(last: &mut Duration, increment: Duration) -> Duration {
@@ -662,7 +704,7 @@ fn send_to_appsrc(
     can_drop: bool,
     is_video: bool,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
-) -> AnyResult<()> {
+) -> AnyResult<bool> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
     const MAX_RETRIES: u32 = 3;
@@ -683,7 +725,7 @@ fn send_to_appsrc(
 
     if retries >= MAX_RETRIES {
         if can_drop {
-            return Ok(());
+            return Ok(false);
         }
     }
 
@@ -736,35 +778,44 @@ fn send_to_appsrc(
     };
 
     match appsrc.push_buffer(buf) {
-        Ok(_) => Ok(()),
-        Err(FlowError::Flushing) => Ok(()),
-        Err(FlowError::Eos) => Ok(()),
+        Ok(_) => Ok(true),
+        Err(FlowError::Flushing) => Ok(false),
+        Err(FlowError::Eos) => Ok(false),
         Err(e) => Err(anyhow::anyhow!("Error in streaming: {e:?}")),
     }?;
     
-    Ok(())
+    Ok(true)
 }
 
-fn drain_latest_batch(rx: &mut tokio::sync::mpsc::Receiver<BcMedia>) -> Option<Vec<BcMedia>> {
+fn drain_latest_batch(
+    rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
+) -> Option<(Vec<BcMedia>, bool)> {
     let first = rx.blocking_recv()?;
     let mut batch = vec![first];
     while let Ok(next) = rx.try_recv() {
         batch.push(next);
     }
 
-    let keep_from = if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
-        last_iframe
+    let needs_keyframe = if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
+        if last_iframe > 0 {
+            let _ = batch.drain(0..last_iframe);
+        }
+        false
     } else if batch.len() > 1 {
-        batch.len() - 1
+        log::debug!(
+            "Dropping drained RTSP batch without a keyframe to preserve decoder state"
+        );
+        batch.clear();
+        true
     } else {
-        0
+        false
     };
 
-    if keep_from > 0 {
-        batch.drain(0..keep_from);
+    if batch.is_empty() {
+        return Some((batch, needs_keyframe));
     }
 
-    Some(batch)
+    Some((batch, needs_keyframe))
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
