@@ -466,8 +466,9 @@ pub(super) async fn make_factory(
                         std::thread::Builder::new()
                             .name(thread_name)
                             .spawn(move || {
-                                let mut vid_ts: u64 = 0;
-                                let mut aud_ts: u64 = 0;
+                                let stream_start = Instant::now();
+                                let mut vid_ts: Duration = Duration::ZERO;
+                                let mut aud_ts: Duration = Duration::ZERO;
                                 let mut pools = Default::default();
 
                                 'sender_loop: {
@@ -480,6 +481,7 @@ pub(super) async fn make_factory(
                                         &aud_src,
                                         &mut vid_ts,
                                         &mut aud_ts,
+                                        stream_start,
                                         &stream_config_clone,
                                     );
                                     if let Err(r) = r {
@@ -498,6 +500,7 @@ pub(super) async fn make_factory(
                                             &aud_src,
                                             &mut vid_ts,
                                             &mut aud_ts,
+                                            stream_start,
                                             &stream_config_clone,
                                         );
                                         if let Err(r) = &r {
@@ -540,52 +543,59 @@ fn send_to_sources(
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u64,
-    aud_ts: &mut u64,
+    vid_ts: &mut Duration,
+    aud_ts: &mut Duration,
+    stream_start: Instant,
     stream_config: &StreamConfig,
 ) -> AnyResult<()> {
     match data {
         BcMedia::Aac(aac) => {
             if let Some(duration) = aac.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
-                    let ts = Duration::from_micros(*aud_ts);
-                    let duration = Duration::from_micros(duration as u64);
-                    send_to_appsrc(aud_src, aac.data, ts, Some(duration), true, pools)?;
+                    let pkt_duration = Duration::from_micros(duration as u64);
+                    let ts = next_timestamp(stream_start.elapsed(), aud_ts, pkt_duration);
+                    send_to_appsrc(aud_src, aac.data, ts, Some(pkt_duration), true, false, pools)?;
                 }
-                *aud_ts += duration as u64;
             }
         }
         BcMedia::Adpcm(adpcm) => {
             if let Some(duration) = adpcm.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
-                    let ts = Duration::from_micros(*aud_ts);
-                    let duration = Duration::from_micros(duration as u64);
-                    send_to_appsrc(aud_src, adpcm.data, ts, Some(duration), true, pools)?;
+                    let pkt_duration = Duration::from_micros(duration as u64);
+                    let ts = next_timestamp(stream_start.elapsed(), aud_ts, pkt_duration);
+                    send_to_appsrc(aud_src, adpcm.data, ts, Some(pkt_duration), true, false, pools)?;
                 }
-                *aud_ts += duration as u64;
             }
         }
         BcMedia::Iframe(BcMediaIframe { data, .. }) => {
             let frame_interval = 1_000_000u64 / u64::from(stream_config.fps.max(1));
             if let Some(vid_src) = vid_src.as_ref() {
-                let ts = Duration::from_micros(*vid_ts);
-                let duration = Duration::from_micros(frame_interval);
-                send_to_appsrc(vid_src, data, ts, Some(duration), false, pools)?;
+                let pkt_duration = Duration::from_micros(frame_interval);
+                let ts = next_timestamp(stream_start.elapsed(), vid_ts, pkt_duration);
+                send_to_appsrc(vid_src, data, ts, Some(pkt_duration), false, true, pools)?;
             }
-            *vid_ts = vid_ts.saturating_add(frame_interval);
         }
         BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             let frame_interval = 1_000_000u64 / u64::from(stream_config.fps.max(1));
             if let Some(vid_src) = vid_src.as_ref() {
-                let ts = Duration::from_micros(*vid_ts);
-                let duration = Duration::from_micros(frame_interval);
-                send_to_appsrc(vid_src, data, ts, Some(duration), true, pools)?;
+                let pkt_duration = Duration::from_micros(frame_interval);
+                let ts = next_timestamp(stream_start.elapsed(), vid_ts, pkt_duration);
+                send_to_appsrc(vid_src, data, ts, Some(pkt_duration), true, true, pools)?;
             }
-            *vid_ts = vid_ts.saturating_add(frame_interval);
         }
         _ => {}
     }
     Ok(())
+}
+
+fn next_timestamp(now: Duration, last: &mut Duration, increment: Duration) -> Duration {
+    let ts = if *last == Duration::ZERO {
+        now
+    } else {
+        now.max(*last + increment)
+    };
+    *last = ts;
+    ts
 }
 
 fn send_to_appsrc(
@@ -594,6 +604,7 @@ fn send_to_appsrc(
     ts: Duration,
     duration: Option<Duration>,
     can_drop: bool,
+    is_video: bool,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
 ) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
@@ -652,8 +663,10 @@ fn send_to_appsrc(
             .ok_or_else(|| anyhow::anyhow!("Failed to get mutable buffer reference"))?;
             
         let time = gstreamer::ClockTime::from_useconds(ts.as_micros() as u64);
-        gst_buf_mut.set_dts(time);
         gst_buf_mut.set_pts(time);
+        if !is_video {
+            gst_buf_mut.set_dts(time);
+        }
         if let Some(duration) = duration {
             gst_buf_mut.set_duration(gstreamer::ClockTime::from_useconds(duration.as_micros() as u64));
         }
