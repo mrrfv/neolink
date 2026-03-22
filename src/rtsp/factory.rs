@@ -183,7 +183,7 @@ impl StreamConfig {
 enum ClientMsg {
     NewClient {
         element: Element,
-        reply: tokio::sync::oneshot::Sender<AnyResult<Element>>,
+        reply: std::sync::mpsc::SyncSender<AnyResult<Element>>,
     },
 }
 
@@ -640,10 +640,19 @@ pub(super) async fn make_factory(
 
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
-        let (reply, new_element) = tokio::sync::oneshot::channel();
-        client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
-
-        let element = new_element.blocking_recv()??;
+        // Use a SyncSender with a timeout so we don't block the RTSP server
+        // indefinitely if the factory background task is busy reopening the camera stream
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        client_tx.try_send(ClientMsg::NewClient {
+            element: element.clone().upcast(),
+            reply: tx,
+        }).ok();
+        
+        let element = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(Ok(e)) => e,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(anyhow::anyhow!("Failed to receive new element from client thread: {e:?}")),
+        };
         Ok(Some(element))
     })
     .await?;
