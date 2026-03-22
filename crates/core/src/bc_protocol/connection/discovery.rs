@@ -1020,7 +1020,10 @@ impl Drop for Discoverer {
         self.cancel.cancel();
         let _gt = tokio::runtime::Handle::current().enter();
         let mut handle = std::mem::take(&mut self.handle);
-        tokio::task::spawn(async move { while handle.get_mut().join_next().await.is_some() {} });
+        tokio::task::spawn(async move {
+            handle.get_mut().abort_all();
+            while handle.get_mut().join_next().await.is_some() {} 
+        });
         log::trace!("Dropped Discoverer");
     }
 }
@@ -1036,6 +1039,10 @@ impl Discovery {
             discoverer: Discoverer::new().await?,
             client_id: generate_cid(),
         })
+    }
+
+    pub(crate) fn reset_client_id(&mut self) {
+        self.client_id = generate_cid();
     }
 
     pub(crate) async fn get_registration(&self, uid: &str) -> Result<RegisterResult> {

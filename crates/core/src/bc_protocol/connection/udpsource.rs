@@ -559,6 +559,21 @@ impl UdpPayloadInner {
             },
         }?;
         log::trace!("Send");
+
+        // Prevent OOM by bounding the reorder buffer.
+        // If we have buffered too many out-of-order packets waiting for a missing one,
+        // we force-advance the stream to the oldest available packet, dropping the missing ones.
+        const MAX_REORDER_BUFFER: usize = 1024; // ~1.3MB at 1350 bytes per packet
+        if self.recieved.len() > MAX_REORDER_BUFFER {
+            if let Some(&first_buffered) = self.recieved.keys().next() {
+                log::error!(
+                    "UDP reorder buffer exceeded limit ({}). Missing packets {} to {}. Force-advancing stream.",
+                    MAX_REORDER_BUFFER, self.packets_want, first_buffered.saturating_sub(1)
+                );
+                self.packets_want = first_buffered;
+            }
+        }
+
         while let Some(payload) = self.recieved.remove(&self.packets_want) {
             log::trace!("  + {}", self.packets_want);
             self.packets_want += 1;

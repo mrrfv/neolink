@@ -253,9 +253,14 @@ impl BcCamera {
                         }
                         log::info!("{}: Registration with reolink servers failed. Retrying: {}/{}", options.name, retry + 1, if max_retry > 0 {format!("{}", max_retry)} else {"infinite".to_string()});
                         retry += 1;
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        // New discovery to get new client IDs
-                        discovery = Discovery::new().await?;
+                        
+                        // Add backoff to discovery retries to prevent network storms when multiple cameras reconnect.
+                        // Cap at 15s to keep reconnects reasonably responsive but not aggressive.
+                        let backoff = std::cmp::min(15, 1 << std::cmp::min(retry, 5));
+                        tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                        // Reset client ID instead of re-spawning a whole new discovery instance and its UDP socket.
+                        // This prevents resource exhaustion and leaking background UDP tasks on every retry.
+                        discovery.reset_client_id();
                     };
                     // Prefer the most direct discovery results first. Racing all methods lets
                     // relay "win" over a direct path, which is faster to establish but much
