@@ -48,6 +48,8 @@ const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for the RTSP client pipeline to become live.
 const SOURCE_READY_POLL: Duration = Duration::from_millis(20);
+/// Maximum number of times `wait_for_sources_ready` will retry before giving up.
+const MAX_READY_RETRIES: u32 = 3;
 const VIDEO_TIMESTAMP_WRAP_WINDOW: u32 = 5_000_000;
 
 /// Capacity of the per-client media queue.
@@ -57,6 +59,11 @@ const VIDEO_TIMESTAMP_WRAP_WINDOW: u32 = 5_000_000;
 /// all the way down into the raw Baichuan packet router.
 const CLIENT_MEDIA_QUEUE_CAPACITY: usize = 500;
 const MAX_BOOTSTRAP_FRAMES: usize = 256;
+
+/// Maximum number of attempts to reopen a camera stream before propagating the error.
+const REOPEN_MAX_RETRIES: u32 = 10;
+/// Maximum delay between reopen attempts (exponential backoff cap).
+const REOPEN_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -181,6 +188,7 @@ enum ClientMsg {
 
 struct ClientState {
     sender: tokio::sync::mpsc::Sender<BcMedia>,
+    thread_handle: Option<std::thread::JoinHandle<AnyResult<()>>>,
 }
 
 #[derive(Default)]
@@ -211,7 +219,8 @@ fn buffer_media(buffer: &mut Vec<BcMedia>, media: BcMedia) {
                 return;
             }
         }
-        let _ = buffer.drain(0..500);
+        let drain_count = buffer.len().saturating_sub(MAX_BOOTSTRAP_FRAMES / 2);
+        let _ = buffer.drain(0..drain_count);
     }
 }
 
@@ -231,17 +240,23 @@ async fn reopen_stream(
     stream: StreamKind,
     name: &str,
 ) -> AnyResult<tokio::sync::mpsc::Receiver<BcMedia>> {
-    loop {
+    let mut delay = STREAM_RETRY_DELAY;
+    for attempt in 0..REOPEN_MAX_RETRIES {
         match camera.stream_while_live(stream).await {
             Ok(new_media_rx) => return Ok(new_media_rx),
             Err(e) => {
                 log::warn!(
-                    "{name}::{stream}: failed to restart camera stream, retrying: {e:?}"
+                    "{name}::{stream}: failed to restart camera stream (attempt {}/{REOPEN_MAX_RETRIES}), retrying in {delay:?}: {e:?}",
+                    attempt + 1,
                 );
-                tokio::time::sleep(STREAM_RETRY_DELAY).await;
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(REOPEN_MAX_DELAY);
             }
         }
     }
+    Err(anyhow!(
+        "{name}::{stream}: stream restart failed after {REOPEN_MAX_RETRIES} attempts"
+    ))
 }
 
 pub(super) async fn make_factory(
@@ -315,6 +330,7 @@ pub(super) async fn make_factory(
         };
 
         let mut clients: Vec<ClientState> = Vec::new();
+        let mut old_thread_handles: Vec<std::thread::JoinHandle<AnyResult<()>>> = Vec::new();
         let mut waiting_for_keyframe = false;
 
         loop {
@@ -377,11 +393,19 @@ pub(super) async fn make_factory(
                                         }
                                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                             log::info!("Client sender disconnected for {name}::{stream}");
+                                            // Collect the thread handle for cleanup
+                                            if let Some(handle) = client.thread_handle {
+                                                old_thread_handles.push(handle);
+                                            }
                                         }
                                     }
                                 }
 
                                 clients = still_open;
+
+                                // Join any finished old sender threads to reclaim resources
+                                old_thread_handles.retain(|h| !h.is_finished());
+
                                 if delivered {
                                     continue;
                                 }
@@ -483,7 +507,6 @@ pub(super) async fn make_factory(
 
                         let (tx, mut rx) =
                             tokio::sync::mpsc::channel(CLIENT_MEDIA_QUEUE_CAPACITY);
-                        clients.push(ClientState { sender: tx });
 
                         let mut to_send = buffer.clone();
                         let bootstrap_needs_keyframe = prepare_bootstrap_batch(&mut to_send);
@@ -491,7 +514,7 @@ pub(super) async fn make_factory(
                         let sender_name = name.clone();
                         let thread_name = format!("{sender_name}::{stream}::sender");
                         let stream_config_clone = stream_config.clone();
-                        std::thread::Builder::new()
+                        let thread_handle = std::thread::Builder::new()
                             .name(thread_name)
                             .spawn(move || {
                                 let name = sender_name;
@@ -572,10 +595,13 @@ pub(super) async fn make_factory(
                                 log::trace!("All media received");
                                 AnyResult::Ok(())
                             })
-                            .unwrap_or_else(|e| {
-                                log::error!("Failed to spawn frame sender thread: {e}");
-                                std::thread::spawn(|| AnyResult::Ok(()))
-                            });
+                            .ok();
+
+                        if thread_handle.is_none() {
+                            log::error!("Failed to spawn frame sender thread");
+                        }
+
+                        clients.push(ClientState { sender: tx, thread_handle });
                     } else {
                         break;
                     }
@@ -807,9 +833,7 @@ fn send_to_appsrc(
         Err(FlowError::Flushing) => Ok(false),
         Err(FlowError::Eos) => Ok(false),
         Err(e) => Err(anyhow::anyhow!("Error in streaming: {e:?}")),
-    }?;
-    
-    Ok(true)
+    }
 }
 
 fn drain_latest_batch(
@@ -881,8 +905,14 @@ fn wait_for_sources_ready(vid_src: &Option<AppSrc>, aud_src: &Option<AppSrc>, na
 
         if start.elapsed() >= SOURCE_READY_TIMEOUT {
             retries += 1;
+            if retries >= MAX_READY_RETRIES {
+                return Err(anyhow!(
+                    "{}::{}: RTSP sources did not become ready after {} retries",
+                    name, stream, retries
+                ));
+            }
             log::info!("OBSERVE: RTSP client startup retry {} for {}::{}", retries, name, stream);
-            start = Instant::now(); // Reset to wait again
+            start = Instant::now();
         }
 
         std::thread::sleep(SOURCE_READY_POLL);
@@ -1324,8 +1354,8 @@ fn make_dbl_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 
     let queue2 = make_element("queue2", &format!("queue2_{}", name))?;
     queue2.set_property("max-size-bytes", buffer_size * 2u32 / 3u32);
-    queue.set_property("max-size-buffers", 0u32);
-    queue.set_property("max-size-time", 0u64);
+    queue2.set_property("max-size-buffers", 0u32);
+    queue2.set_property("max-size-time", 0u64);
     queue2.set_property(
         "max-size-time",
         std::convert::TryInto::<u64>::try_into(tokio::time::Duration::from_secs(5).as_nanos())

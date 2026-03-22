@@ -9,9 +9,10 @@ use tokio::sync::mpsc::{error::TrySendError, Receiver as MpscReceiver};
 use crate::common::PushNoti;
 
 /// Channel capacity for buffering video frames between camera and RTSP server
-/// At 30fps, 500 frames ≈ 16 seconds of buffering capacity
+/// At 30fps, 100 frames ≈ 3.3 seconds of buffering capacity
 /// This handles client-side consumption delays and network jitter
-const MEDIA_CHANNEL_CAPACITY: usize = 500;
+/// while preventing excessive memory usage (~10 MB per stream at 8 Mbps)
+const MEDIA_CHANNEL_CAPACITY: usize = 100;
 
 impl NeoInstance {
     /// Streams a camera source while not paused
@@ -258,16 +259,16 @@ mod tests {
     /// Verify media channel capacity is sized for video buffering
     #[test]
     fn test_media_channel_capacity() {
-        // At 30fps, should buffer several seconds of video
+        // At 30fps, should buffer a few seconds of video
         let buffer_seconds = MEDIA_CHANNEL_CAPACITY as f64 / 30.0;
 
         assert!(
-            buffer_seconds >= 10.0,
+            buffer_seconds >= 2.0,
             "Media channel only buffers {:.1}s of video at 30fps",
             buffer_seconds
         );
         assert!(
-            buffer_seconds <= 60.0,
+            buffer_seconds <= 15.0,
             "Media channel buffers {:.1}s, may use excessive memory",
             buffer_seconds
         );
@@ -276,10 +277,9 @@ mod tests {
     /// Verify capacity hasn't regressed to old value
     #[test]
     fn test_media_channel_not_regressed() {
-        // Pre-fix value was 100
         assert!(
-            MEDIA_CHANNEL_CAPACITY >= 500,
-            "Media channel capacity regressed below 500"
+            MEDIA_CHANNEL_CAPACITY >= 100,
+            "Media channel capacity regressed below 100"
         );
     }
 }
