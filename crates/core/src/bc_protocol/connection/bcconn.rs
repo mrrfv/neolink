@@ -30,16 +30,17 @@ use tokio::{sync::RwLock, task::JoinSet};
 // - Smaller = lower latency, but more prone to frame drops
 
 /// Capacity for outgoing message channel (camera → subscribers)
-/// Sized for ~16 seconds of video frames at 30fps
-const MESSAGE_CHANNEL_CAPACITY: usize = 500;
+/// Sized for ~6.6 seconds of video frames at 30fps, aligned with downstream
+/// RTSP channel sizes to prevent latency buildup between layers.
+const MESSAGE_CHANNEL_CAPACITY: usize = 200;
 
 /// Capacity for internal poll command routing
 /// Higher than message capacity to prevent command starvation during high video traffic
-const POLL_COMMAND_CAPACITY: usize = 1000;
+const POLL_COMMAND_CAPACITY: usize = 400;
 
 /// Capacity for individual subscriber channels
 /// Matches message channel to prevent asymmetric backpressure
-const SUBSCRIBER_CHANNEL_CAPACITY: usize = 500;
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 200;
 
 /// Interval between subscriber cleanup passes (in seconds)
 ///
@@ -507,13 +508,12 @@ mod tests {
     #[test]
     fn test_channel_capacities_are_reasonable() {
         // Message channel should hold several seconds of video at 30fps
-        // 500 / 30fps = ~16 seconds
         assert!(
             MESSAGE_CHANNEL_CAPACITY >= 100,
             "Message channel too small for video buffering"
         );
         assert!(
-            MESSAGE_CHANNEL_CAPACITY <= 2000,
+            MESSAGE_CHANNEL_CAPACITY <= 1000,
             "Message channel too large, excessive memory use"
         );
 
@@ -536,18 +536,17 @@ mod tests {
     /// to old smaller values
     #[test]
     fn test_channel_capacities_not_regressed() {
-        // Pre-fix values were 100/200/100 - ensure we haven't regressed
         assert!(
-            MESSAGE_CHANNEL_CAPACITY >= 500,
-            "Message channel capacity regressed below 500"
+            MESSAGE_CHANNEL_CAPACITY >= 200,
+            "Message channel capacity regressed below 200"
         );
         assert!(
-            POLL_COMMAND_CAPACITY >= 1000,
-            "Poll command capacity regressed below 1000"
+            POLL_COMMAND_CAPACITY >= 400,
+            "Poll command capacity regressed below 400"
         );
         assert!(
-            SUBSCRIBER_CHANNEL_CAPACITY >= 500,
-            "Subscriber channel capacity regressed below 500"
+            SUBSCRIBER_CHANNEL_CAPACITY >= 200,
+            "Subscriber channel capacity regressed below 200"
         );
     }
 }

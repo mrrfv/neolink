@@ -57,7 +57,8 @@ const VIDEO_TIMESTAMP_WRAP_WINDOW: u32 = 5_000_000;
 /// This queue carries fully parsed `BcMedia` packets, so dropping from here is
 /// recoverable. Keeping it bounded prevents RTSP backpressure from propagating
 /// all the way down into the raw Baichuan packet router.
-const CLIENT_MEDIA_QUEUE_CAPACITY: usize = 500;
+/// At 30fps, 100 frames ≈ 3.3 seconds — enough for jitter, low enough to bound memory.
+const CLIENT_MEDIA_QUEUE_CAPACITY: usize = 100;
 const MAX_BOOTSTRAP_FRAMES: usize = 256;
 
 /// Maximum number of attempts to reopen a camera stream before propagating the error.
@@ -332,6 +333,9 @@ pub(super) async fn make_factory(
         let mut clients: Vec<ClientState> = Vec::new();
         let mut old_thread_handles: Vec<std::thread::JoinHandle<AnyResult<()>>> = Vec::new();
         let mut waiting_for_keyframe = false;
+        // Shared flag: set by main loop on stream reconnect, read by sender threads
+        // to reset their TimestampState and avoid non-monotonic DTS.
+        let timestamps_reset_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         loop {
             tokio::select! {
@@ -415,6 +419,7 @@ pub(super) async fn make_factory(
                             log::warn!("{name}::{stream}: Camera stream channel closed, restarting");
                             waiting_for_keyframe = true;
                             buffer.clear();
+                            timestamps_reset_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                             media_rx = reopen_stream(&camera, stream, &name).await?;
                         }
                         Err(_) => {
@@ -424,6 +429,7 @@ pub(super) async fn make_factory(
                             );
                             waiting_for_keyframe = true;
                             buffer.clear();
+                            timestamps_reset_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                             media_rx = reopen_stream(&camera, stream, &name).await?;
                         }
                     }
@@ -514,6 +520,7 @@ pub(super) async fn make_factory(
                         let sender_name = name.clone();
                         let thread_name = format!("{sender_name}::{stream}::sender");
                         let stream_config_clone = stream_config.clone();
+                        let thread_ts_reset = timestamps_reset_flag.clone();
                         let thread_handle = std::thread::Builder::new()
                             .name(thread_name)
                             .spawn(move || {
@@ -563,6 +570,13 @@ pub(super) async fn make_factory(
                                     log::trace!("Sending new frames");
                                 while let Some(mut batch) = drain_latest_batch(&mut rx) {
                                     for data in batch.drain(..) {
+                                        // Check if the main loop signaled a stream reconnect
+                                        if thread_ts_reset.load(std::sync::atomic::Ordering::Relaxed) {
+                                            log::info!("{name}::{stream}: Resetting timestamps after stream reconnect");
+                                            timestamps = TimestampState::default();
+                                            thread_ts_reset.store(false, std::sync::atomic::Ordering::Relaxed);
+                                        }
+
                                         if waiting_for_keyframe {
                                             if !is_keyframe(&data) {
                                                 continue;
@@ -606,6 +620,19 @@ pub(super) async fn make_factory(
                         break;
                     }
                 }
+            }
+        }
+        // Clean up: join all remaining sender threads to prevent resource leaks
+        for client in clients.drain(..) {
+            if let Some(handle) = client.thread_handle {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        for handle in old_thread_handles.drain(..) {
+            if handle.is_finished() {
+                let _ = handle.join();
             }
         }
         AnyResult::Ok(())
