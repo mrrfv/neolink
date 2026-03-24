@@ -39,6 +39,49 @@ const MAX_MISSED_PINGS: u32 = 10;
 /// Some cameras return errors if queried too quickly after login
 const CAMERA_WAKEUP_DELAY: Duration = Duration::from_secs(2);
 
+#[derive(Default, Debug, Clone)]
+struct PingLatencyStats {
+    count: u64,
+    min_ms: f64,
+    max_ms: f64,
+    sum_ms: f64,
+    sum_sq_ms: f64,
+}
+
+impl PingLatencyStats {
+    fn record(&mut self, elapsed: Duration) {
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        if self.count == 0 {
+            self.min_ms = ms;
+            self.max_ms = ms;
+        } else {
+            self.min_ms = self.min_ms.min(ms);
+            self.max_ms = self.max_ms.max(ms);
+        }
+        self.count += 1;
+        self.sum_ms += ms;
+        self.sum_sq_ms += ms * ms;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn format_ms(&self) -> String {
+        if self.is_empty() {
+            "n/a".to_string()
+        } else {
+            let avg_ms = self.sum_ms / self.count as f64;
+            let variance = (self.sum_sq_ms / self.count as f64) - (avg_ms * avg_ms);
+            let mdev_ms = variance.max(0.0).sqrt();
+            format!(
+                "min={:.1} max={:.1} avg={:.1} mdev={:.1}",
+                self.min_ms, self.max_ms, avg_ms, mdev_ms
+            )
+        }
+    }
+}
+
 #[derive(Eq, PartialEq, Copy, Clone)]
 pub(crate) enum NeoCamThreadState {
     Connected,
@@ -103,6 +146,7 @@ impl NeoCamThread {
         let mut ping_timeout = 0usize;
         let mut ping_unintelligible = 0usize;
         let mut ping_other = 0usize;
+        let mut ping_latency = PingLatencyStats::default();
         let session_start = Instant::now();
         // Now we wait for a disconnect
         tokio::select! {
@@ -121,21 +165,24 @@ impl NeoCamThread {
                     tokio::select! {
                         _ = health_tick.tick() => {
                             log::info!(
-                                "{}: Connection status=healthy, uptime={:?}, ping_ok={}, ping_timeout={}, ping_bad_reply={}, consecutive_failures={}/{}",
+                                "{}: Connection status=healthy, uptime={:?}, ping_ok={}, ping_timeout={}, ping_bad_reply={}, ping_ms={}, consecutive_failures={}/{}",
                                 name,
                                 session_start.elapsed(),
                                 ping_ok,
                                 ping_timeout,
                                 ping_unintelligible + ping_other,
+                                ping_latency.format_ms(),
                                 missed_pings,
                                 MAX_MISSED_PINGS
                             );
                         }
                         _ = ping_interval.tick() => {
                             log::trace!("Sending ping");
+                            let ping_start = Instant::now();
                             match timeout(PING_TIMEOUT, camera.get_linktype()).await {
                                 Ok(Ok(_)) => {
                                     ping_ok += 1;
+                                    ping_latency.record(ping_start.elapsed());
                                     log::trace!("Ping reply received");
                                     missed_pings = 0;
                                     continue
@@ -203,22 +250,24 @@ impl NeoCamThread {
             } => {
                 if let Err(ref e) = v {
                     log::warn!(
-                        "{}: Connection status=degraded, uptime={:?}, ping_ok={}, ping_timeout={}, ping_bad_reply={}",
+                        "{}: Connection status=degraded, uptime={:?}, ping_ok={}, ping_timeout={}, ping_bad_reply={}, ping_ms={}",
                         name,
                         session_start.elapsed(),
                         ping_ok,
                         ping_timeout,
-                        ping_unintelligible + ping_other
+                        ping_unintelligible + ping_other,
+                        ping_latency.format_ms()
                     );
                     log::debug!("{}: camera session ended with error: {:?}", name, e);
                 } else {
                     log::info!(
-                        "{}: Connection status=ended normally, uptime={:?}, ping_ok={}, ping_timeout={}, ping_bad_reply={}",
+                        "{}: Connection status=ended normally, uptime={:?}, ping_ok={}, ping_timeout={}, ping_bad_reply={}, ping_ms={}",
                         name,
                         session_start.elapsed(),
                         ping_ok,
                         ping_timeout,
-                        ping_unintelligible + ping_other
+                        ping_unintelligible + ping_other,
+                        ping_latency.format_ms()
                     );
                 }
                 v
@@ -226,12 +275,13 @@ impl NeoCamThread {
         }?;
 
         log::info!(
-            "{}: Camera session closed cleanly after {:?} (ping_ok={}, ping_timeout={}, ping_bad_reply={})",
+            "{}: Camera session closed cleanly after {:?} (ping_ok={}, ping_timeout={}, ping_bad_reply={}, ping_ms={})",
             name,
             session_start.elapsed(),
             ping_ok,
             ping_timeout,
-            ping_unintelligible + ping_other
+            ping_unintelligible + ping_other,
+            ping_latency.format_ms()
         );
         let _ = camera.logout().await;
         let _ = camera.shutdown().await;
