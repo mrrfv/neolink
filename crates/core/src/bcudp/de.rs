@@ -11,6 +11,10 @@ use nom::{
 
 type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
 
+// UDP discovery/control packets are tiny; anything larger is almost certainly
+// a malformed frame or corrupted length field.
+const MAX_UDP_PAYLOAD: u32 = 64 * 1024;
+
 fn make_error<I, E>(input: I, ctx: &'static str, kind: ErrorKind) -> E
 where
     I: std::marker::Copy,
@@ -62,6 +66,13 @@ fn bcudp(buf: &[u8]) -> IResult<&[u8], BcUdp> {
 
 fn udp_disc(buf: &[u8]) -> IResult<&[u8], UdpDiscovery> {
     let (buf, payload_size) = error_context("DISC: Missing payload size", le_u32)(buf)?;
+    if payload_size > MAX_UDP_PAYLOAD {
+        return Err(Err::Failure(make_error(
+            buf,
+            "DISC: payload size exceeds decoder limit",
+            ErrorKind::Verify,
+        )));
+    }
     let (buf, _unknown_a) = error_context(
         "DISC: Unable to verify UnknowA",
         verify(le_u32, |&x| x == 1),
@@ -102,7 +113,10 @@ fn udp_ack(buf: &[u8]) -> IResult<&[u8], UdpAck> {
     let (buf, packet_id) = error_context("Missing packet_id", le_u32)(buf)?; // This is the point at which the camera has contigious
                                                                              // packets to
     let (buf, maybe_latency) = error_context("ACK: Missing Maybe Latency", le_u32)(buf)?;
-    let (buf, payload_size) = error_context("ACK: Missing payload_size", le_u32)(buf)?;
+    let (buf, payload_size) = error_context(
+        "ACK: Missing payload_size",
+        verify(le_u32, |x| *x <= MAX_UDP_PAYLOAD),
+    )(buf)?;
     let (buf, payload) = if payload_size > 0 {
         let (buf, t_payload) = take(payload_size)(buf)?; // It is a binary payload of
                                                          // `00 01 01 01 01 00 01`
@@ -129,7 +143,10 @@ fn udp_data(buf: &[u8]) -> IResult<&[u8], UdpData> {
     let (buf, _unknown_a) =
         error_context("DATA: Unable to verify UnownA", verify(le_u32, |&x| x == 0))(buf)?;
     let (buf, packet_id) = error_context("DATA: Missing packet_id", le_u32)(buf)?;
-    let (buf, payload_size) = error_context("DATA: Missing payload_size", le_u32)(buf)?;
+    let (buf, payload_size) = error_context(
+        "DATA: Missing payload_size",
+        verify(le_u32, |x| *x <= MAX_UDP_PAYLOAD),
+    )(buf)?;
     let (buf, payload) = take(payload_size)(buf)?;
 
     let data = UdpData {
@@ -155,6 +172,17 @@ mod tests {
         let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
             .is_test(true)
             .try_init();
+    }
+
+    #[test]
+    fn test_rejects_oversized_payload() {
+        init();
+
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&MAGIC_HEADER_UDP_DATA.to_le_bytes());
+        buf.extend_from_slice(&(super::MAX_UDP_PAYLOAD + 1).to_le_bytes());
+
+        assert!(BcUdp::deserialize(&mut buf).is_err());
     }
 
     #[test]

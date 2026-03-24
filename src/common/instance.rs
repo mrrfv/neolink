@@ -110,12 +110,14 @@ impl NeoInstance {
             () => {{
                 retry_count += 1;
                 if retry_count >= PASSIVE_RETRY_LIMIT {
-                    return Err(anyhow!("{name}: passive task exceeded {PASSIVE_RETRY_LIMIT} retries").into());
+                    return Err(anyhow!(
+                        "{name}: passive task exceeded {PASSIVE_RETRY_LIMIT} retries"
+                    )
+                    .into());
                 }
                 continue;
             }};
         }
-
 
         loop {
             camera = camera_watch

@@ -59,7 +59,11 @@ impl StreamData {
     /// Pull data from the camera's buffer
     /// This returns raw BcMedia packets
     pub async fn get_data(&mut self) -> Result<Result<BcMedia>> {
-        if self.handle.as_ref().is_some_and(|handle| handle.is_finished()) {
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
             self.abort_handle.cancel();
             if let Some(handle) = self.handle.take() {
                 handle.await??;
@@ -360,8 +364,17 @@ mod tests {
 
     #[test]
     fn stream_handles_are_unique_per_session() {
-        assert_ne!(stream_handle(0, StreamKind::Main), stream_handle(1, StreamKind::Main));
-        assert_ne!(stream_handle(42, StreamKind::Main), stream_handle(42, StreamKind::Sub));
-        assert_ne!(stream_handle(42, StreamKind::Sub), stream_handle(42, StreamKind::Extern));
+        assert_ne!(
+            stream_handle(0, StreamKind::Main),
+            stream_handle(1, StreamKind::Main)
+        );
+        assert_ne!(
+            stream_handle(42, StreamKind::Main),
+            stream_handle(42, StreamKind::Sub)
+        );
+        assert_ne!(
+            stream_handle(42, StreamKind::Sub),
+            stream_handle(42, StreamKind::Extern)
+        );
     }
 }

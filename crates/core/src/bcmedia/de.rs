@@ -8,6 +8,8 @@ type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>
 
 // PAD_SIZE: Media packets use 8 byte padding
 const PAD_SIZE: u32 = 8;
+// Media frames should never approach unbounded sizes; treat anything above this as corrupt.
+const MAX_MEDIA_PAYLOAD: u32 = 4 * 1024 * 1024;
 
 impl BcMedia {
     pub(crate) fn deserialize(buf: &mut BytesMut) -> Result<BcMedia, Error> {
@@ -38,11 +40,17 @@ fn bcmedia(buf: &[u8]) -> IResult<&[u8], BcMedia> {
                 || (*x == MAGIC_HEADER_BCMEDIA_NULL)
                 || (*x == MAGIC_HEADER_BCMEDIA_INFO_ALT)
         }),
-    )(buf).map_err(|e| {
+    )(buf)
+    .map_err(|e| {
         if original_buf.len() >= 4 {
             let le = u32::from_le_bytes(original_buf[0..4].try_into().unwrap());
             let be = u32::from_be_bytes(original_buf[0..4].try_into().unwrap());
-            log::debug!("Invalid Magic at start: LE:{:08x} BE:{:08x} (next 28 bytes: {:02x?})", le, be, &original_buf[4..original_buf.len().min(32)]);
+            log::debug!(
+                "Invalid Magic at start: LE:{:08x} BE:{:08x} (next 28 bytes: {:02x?})",
+                le,
+                be,
+                &original_buf[4..original_buf.len().min(32)]
+            );
         }
         e
     })?;
@@ -181,8 +189,14 @@ fn bcmedia_iframe(buf: &[u8]) -> IResult<&[u8], BcMediaIframe> {
         "Video Type is unrecognised in IFrame",
         verify(take4, |x| matches!(x, "H264" | "H265")),
     )(buf)?;
-    let (buf, payload_size) = le_u32(buf)?;
-    let (buf, additional_header_size) = le_u32(buf)?;
+    let (buf, payload_size) = context(
+        "IFrame payload size exceeds decoder limit",
+        verify(le_u32, |x| *x <= MAX_MEDIA_PAYLOAD),
+    )(buf)?;
+    let (buf, additional_header_size) = context(
+        "IFrame additional header exceeds decoder limit",
+        verify(le_u32, |x| *x <= MAX_MEDIA_PAYLOAD),
+    )(buf)?;
     let (buf, microseconds) = le_u32(buf)?;
     let (buf, _unknown_b) = le_u32(buf)?;
     let (buf, time) = if additional_header_size >= 4 {
@@ -205,7 +219,6 @@ fn bcmedia_iframe(buf: &[u8]) -> IResult<&[u8], BcMediaIframe> {
         n => PAD_SIZE - n,
     };
     let (buf, _padding) = take(pad_size)(buf)?;
-    assert_eq!(payload_size as usize, data_slice.len());
 
     let video_type = match video_type_str {
         "H264" => VideoType::H264,
@@ -230,8 +243,14 @@ fn bcmedia_pframe(buf: &[u8]) -> IResult<&[u8], BcMediaPframe> {
         "Video Type is unrecognised in PFrame",
         verify(take4, |x| matches!(x, "H264" | "H265")),
     )(buf)?;
-    let (buf, payload_size) = le_u32(buf)?;
-    let (buf, additional_header_size) = le_u32(buf)?;
+    let (buf, payload_size) = context(
+        "PFrame payload size exceeds decoder limit",
+        verify(le_u32, |x| *x <= MAX_MEDIA_PAYLOAD),
+    )(buf)?;
+    let (buf, additional_header_size) = context(
+        "PFrame additional header exceeds decoder limit",
+        verify(le_u32, |x| *x <= MAX_MEDIA_PAYLOAD),
+    )(buf)?;
     let (buf, microseconds) = le_u32(buf)?;
     let (buf, _unknown_b) = le_u32(buf)?;
     let (buf, _additional_header) = take(additional_header_size)(buf)?;
@@ -241,7 +260,6 @@ fn bcmedia_pframe(buf: &[u8]) -> IResult<&[u8], BcMediaPframe> {
         n => PAD_SIZE - n,
     };
     let (buf, _padding) = take(pad_size)(buf)?;
-    assert_eq!(payload_size as usize, data_slice.len());
 
     let video_type = match video_type_str {
         "H264" => VideoType::H264,
@@ -261,7 +279,10 @@ fn bcmedia_pframe(buf: &[u8]) -> IResult<&[u8], BcMediaPframe> {
 }
 
 fn bcmedia_aac(buf: &[u8]) -> IResult<&[u8], BcMediaAac> {
-    let (buf, payload_size) = le_u16(buf)?;
+    let (buf, payload_size) = context(
+        "AAC payload size exceeds decoder limit",
+        verify(le_u16, |x| (*x as u32) <= MAX_MEDIA_PAYLOAD),
+    )(buf)?;
     let (buf, _payload_size_b) = le_u16(buf)?;
     let (buf, data_slice) = take(payload_size)(buf)?;
     let pad_size = match payload_size as u32 % PAD_SIZE {
@@ -282,7 +303,12 @@ fn bcmedia_aac(buf: &[u8]) -> IResult<&[u8], BcMediaAac> {
 fn bcmedia_adpcm(buf: &[u8]) -> IResult<&[u8], BcMediaAdpcm> {
     const SUB_HEADER_SIZE: u16 = 4;
 
-    let (buf, payload_size) = le_u16(buf)?;
+    let (buf, payload_size) = context(
+        "ADPCM payload size exceeds decoder limit",
+        verify(le_u16, |x| {
+            (*x as u32) <= MAX_MEDIA_PAYLOAD && *x >= SUB_HEADER_SIZE
+        }),
+    )(buf)?;
     let (buf, _payload_size_b) = le_u16(buf)?;
     let (buf, _magic) = context(
         "ADPCM data magic value is invalid",
@@ -322,6 +348,19 @@ mod tests {
         let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
             .is_test(true)
             .try_init();
+    }
+
+    #[test]
+    fn test_rejects_oversized_payload() {
+        init();
+
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&super::MAGIC_HEADER_BCMEDIA_IFRAME.to_le_bytes());
+        buf.extend_from_slice(b"H264");
+        buf.extend_from_slice(&(super::MAX_MEDIA_PAYLOAD + 1).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        assert!(BcMedia::deserialize(&mut buf).is_err());
     }
 
     #[test]

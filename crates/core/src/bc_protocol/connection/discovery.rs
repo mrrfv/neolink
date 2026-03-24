@@ -149,8 +149,18 @@ impl Discoverer {
                                         needs_removal = true;
                                     }
                                 } else {
-                                    for sender in thread_handlers.write().await.iter_mut() {
-                                        let _ = sender.send(Ok((bcudp.clone(), addr))).await;
+                                    let mut handlers = thread_handlers.write().await;
+                                    let mut idx = 0;
+                                    while idx < handlers.len() {
+                                        if handlers[idx]
+                                            .send(Ok((bcudp.clone(), addr)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            handlers.remove(idx);
+                                        } else {
+                                            idx += 1;
+                                        }
                                     }
                                 }
                                 if needs_removal {
@@ -1022,7 +1032,7 @@ impl Drop for Discoverer {
         let mut handle = std::mem::take(&mut self.handle);
         tokio::task::spawn(async move {
             handle.get_mut().abort_all();
-            while handle.get_mut().join_next().await.is_some() {} 
+            while handle.get_mut().join_next().await.is_some() {}
         });
         log::trace!("Dropped Discoverer");
     }

@@ -9,6 +9,10 @@ use nom::{
 
 type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
 
+// Modern Baichuan packets are still small enough that anything larger than this
+// is almost certainly corrupted input rather than a legitimate frame.
+const MAX_BC_BODY_LEN: u32 = 8 * 1024 * 1024;
+
 impl Bc {
     /// Returns Ok(deserialized data, the amount of data consumed)
     /// Can then use this as the amount that should be remove from a buffer
@@ -92,9 +96,32 @@ fn bc_modern_msg<'a>(
 
     // If missing payload_offset treat all as payload
     let ext_len = header.payload_offset.unwrap_or_default();
+    if header.body_len > MAX_BC_BODY_LEN {
+        return Err(Err::Failure(make_error(
+            buf,
+            "Body length exceeds decoder limit",
+            ErrorKind::Verify,
+        )));
+    }
+    if ext_len > header.body_len {
+        return Err(Err::Failure(make_error(
+            buf,
+            "Payload offset exceeds body length",
+            ErrorKind::Verify,
+        )));
+    }
 
     let (buf, ext_buf) = take(ext_len)(buf)?;
-    let payload_len = header.body_len - ext_len;
+    let payload_len = match header.body_len.checked_sub(ext_len) {
+        Some(len) => len,
+        None => {
+            return Err(Err::Failure(make_error(
+                buf,
+                "Payload length underflow",
+                ErrorKind::Verify,
+            )));
+        }
+    };
     let (buf, payload_buf) = take(payload_len)(buf)?;
 
     let decrypted;
@@ -227,7 +254,8 @@ fn bc_header(buf: &[u8]) -> IResult<&[u8], BcHeader> {
         verify(le_u32, |x| *x == MAGIC_HEADER || *x == MAGIC_HEADER_REV),
     )(buf)?;
     let (buf, msg_id) = error_context("MsgID missing", le_u32)(buf)?;
-    let (buf, body_len) = error_context("BodyLen missing", le_u32)(buf)?;
+    let (buf, body_len) =
+        error_context("BodyLen missing", verify(le_u32, |x| *x <= MAX_BC_BODY_LEN))(buf)?;
     let (buf, channel_id) = error_context("ChannelID missing", le_u8)(buf)?;
     let (buf, stream_type) = error_context("StreamType missing", le_u8)(buf)?;
     let (buf, msg_num) = error_context("MsgNum missing", le_u16)(buf)?;
@@ -259,6 +287,7 @@ mod tests {
     use super::*;
     use crate::bc::xml::*;
     use assert_matches::assert_matches;
+    use bytes::BytesMut;
     use env_logger::Env;
 
     fn init() {
@@ -407,6 +436,23 @@ mod tests {
             }) => {}
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn test_rejects_oversized_body_len() {
+        init();
+
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&MAGIC_HEADER.to_le_bytes());
+        buf.extend_from_slice(&MSG_ID_VIDEO.to_le_bytes());
+        buf.extend_from_slice(&(MAX_BC_BODY_LEN + 1).to_le_bytes());
+        buf.extend_from_slice(&0u8.to_le_bytes());
+        buf.extend_from_slice(&0u8.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0x6614u16.to_le_bytes());
+
+        assert!(bc_header(&buf).is_err());
     }
 
     #[test]

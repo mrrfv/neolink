@@ -408,14 +408,18 @@ impl Poller {
 
                                         match sender.try_send(Ok(response)) {
                                             Ok(()) => {}
-                                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            Err(tokio::sync::mpsc::error::TrySendError::Full(
+                                                _,
+                                            )) => {
                                                 warn!(
                                                     "OBSERVE: Subscriber full for msg {} (ID: {}), dropping subscriber to avoid backpressure",
                                                     msg_num, msg_id
                                                 );
                                                 occ.remove(&Some(msg_num));
                                             }
-                                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            Err(
+                                                tokio::sync::mpsc::error::TrySendError::Closed(_),
+                                            ) => {
                                                 warn!(
                                                     "Subscriber closed for msg {} (ID: {}), dropping subscriber",
                                                     msg_num, msg_id

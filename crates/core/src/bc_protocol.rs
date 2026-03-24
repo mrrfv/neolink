@@ -125,7 +125,12 @@ pub enum PrintFormat {
 pub enum ConnectionProtocol {
     /// TCP and UDP
     #[default]
-    #[serde(alias = "tcpudp", alias = "tcp_udp", alias = "TCPUDP", alias = "TCP_UDP")]
+    #[serde(
+        alias = "tcpudp",
+        alias = "tcp_udp",
+        alias = "TCPUDP",
+        alias = "TCP_UDP"
+    )]
     TcpUdp,
     /// TCP only
     #[serde(alias = "tcp", alias = "TCP")]
@@ -148,7 +153,8 @@ impl BcCamera {
         let can_try_udp = matches!(
             options.protocol,
             ConnectionProtocol::Udp | ConnectionProtocol::TcpUdp
-        ) || (matches!(options.protocol, ConnectionProtocol::Tcp) && options.uid.is_some());
+        ) || (matches!(options.protocol, ConnectionProtocol::Tcp)
+            && options.uid.is_some());
         if let ConnectionProtocol::Tcp | ConnectionProtocol::TcpUdp = options.protocol {
             let mut sockets = vec![];
             match options.port {
@@ -184,8 +190,7 @@ impl BcCamera {
             }
         }
 
-        if let (Some(uid), true) = (options.uid.as_ref(), can_try_udp)
-        {
+        if let (Some(uid), true) = (options.uid.as_ref(), can_try_udp) {
             let mut sockets = vec![];
             match options.port {
                 None | Some(2015) | Some(2018) => {
@@ -253,7 +258,7 @@ impl BcCamera {
                         }
                         log::info!("{}: Registration with reolink servers failed. Retrying: {}/{}", options.name, retry + 1, if max_retry > 0 {format!("{}", max_retry)} else {"infinite".to_string()});
                         retry += 1;
-                        
+
                         // Add backoff to discovery retries to prevent network storms when multiple cameras reconnect.
                         // Cap at 15s to keep reconnects reasonably responsive but not aggressive.
                         let backoff = std::cmp::min(15, 1 << std::cmp::min(retry, 5));

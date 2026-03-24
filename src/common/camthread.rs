@@ -72,11 +72,18 @@ impl NeoCamThread {
         let connect_start = std::time::Instant::now();
         let camera = Arc::new(connect_and_login(config).await?);
         let connect_elapsed = connect_start.elapsed();
-        log::info!("{}: Connected to camera in {:.1}s", name, connect_elapsed.as_secs_f64());
+        log::info!(
+            "{}: Connected to camera in {:.1}s",
+            name,
+            connect_elapsed.as_secs_f64()
+        );
 
         sleep(CAMERA_WAKEUP_DELAY).await;
         if let Err(e) = update_camera_time(&camera, &name, config.update_time).await {
-            log::warn!("{}: Could not set camera time (perhaps your login is not an admin): {e:?}", name);
+            log::warn!(
+                "{}: Could not set camera time (perhaps your login is not an admin): {e:?}",
+                name
+            );
         }
         sleep(CAMERA_WAKEUP_DELAY).await;
 
@@ -105,9 +112,22 @@ impl NeoCamThread {
                             continue
                         },
                         Ok(Err(neolink_core::Error::UnintelligibleReply { reply, why })) => {
-                            // Camera does not support pings just wait forever
-                            log::trace!("Pings not supported: {reply:?}: {why}");
-                            futures::future::pending().await
+                            log::warn!(
+                                "{}: Unintelligible ping reply from camera: {reply:?}: {why}",
+                                name
+                            );
+                            missed_pings += 1;
+                            if missed_pings < MAX_MISSED_PINGS {
+                                continue;
+                            } else {
+                                log::error!(
+                                    "Timed out waiting for camera ping reply ({} consecutive failures)",
+                                    missed_pings
+                                );
+                                break Err(anyhow::anyhow!(
+                                    "Timed out waiting for camera ping reply"
+                                ));
+                            }
                         },
                         Ok(Err(e)) => {
                             break Err(e.into());
