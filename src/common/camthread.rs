@@ -38,6 +38,10 @@ const MAX_MISSED_PINGS: u32 = 10;
 /// Delay after connection to allow camera firmware to fully initialize
 /// Some cameras return errors if queried too quickly after login
 const CAMERA_WAKEUP_DELAY: Duration = Duration::from_secs(2);
+const RECONNECT_MIN_BACKOFF: Duration = Duration::from_millis(500);
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(15);
+const RECONNECT_JITTER_MAX: Duration = Duration::from_millis(250);
+const RECONNECT_STABLE_RESET: Duration = Duration::from_secs(60);
 
 #[derive(Default, Debug, Clone)]
 struct PingLatencyStats {
@@ -82,6 +86,90 @@ impl PingLatencyStats {
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum ReconnectFailureKind {
+    Transient,
+    Noisy,
+    Fatal,
+}
+
+fn classify_reconnect_failure(error: &anyhow::Error) -> ReconnectFailureKind {
+    match error.downcast_ref::<neolink_core::Error>() {
+        Some(neolink_core::Error::CameraLoginFail) => ReconnectFailureKind::Fatal,
+        Some(
+            neolink_core::Error::TimeoutDisconnected
+            | neolink_core::Error::Timeout(_)
+            | neolink_core::Error::StreamFinished
+            | neolink_core::Error::DroppedConnection
+            | neolink_core::Error::DroppedConnectionTry(_)
+            | neolink_core::Error::BroadcastDroppedConnectionTry(_)
+            | neolink_core::Error::TokioBcSendError
+            | neolink_core::Error::ConnectionUnavailable
+            | neolink_core::Error::BcUdpTimeout
+            | neolink_core::Error::BcUdpReconnectTimeout,
+        ) => ReconnectFailureKind::Noisy,
+        Some(neolink_core::Error::UnintelligibleReply { .. }) => ReconnectFailureKind::Noisy,
+        Some(neolink_core::Error::CameraServiceUnavailable { .. }) => {
+            ReconnectFailureKind::Transient
+        }
+        _ => ReconnectFailureKind::Transient,
+    }
+}
+
+fn format_ping_latency_metrics(stats: &PingLatencyStats) -> String {
+    stats.format_ms()
+}
+
+fn jittered_backoff(base: Duration) -> Duration {
+    let base_ms = base.as_millis() as u64;
+    let jitter_cap = RECONNECT_JITTER_MAX.as_millis() as u64;
+    let spread = std::cmp::max(base_ms / 4, jitter_cap / 2);
+    let low = base_ms.saturating_sub(spread);
+    let high = base_ms.saturating_add(spread);
+    let chosen = if low >= high {
+        base_ms
+    } else {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        low + (seed % (high - low + 1))
+    };
+    Duration::from_millis(chosen.clamp(
+        RECONNECT_MIN_BACKOFF.as_millis() as u64,
+        RECONNECT_MAX_BACKOFF.as_millis() as u64,
+    ))
+}
+
+fn next_backoff_delay(
+    current: Duration,
+    kind: ReconnectFailureKind,
+    session_uptime: Duration,
+) -> Duration {
+    if session_uptime >= RECONNECT_STABLE_RESET {
+        return RECONNECT_MIN_BACKOFF;
+    }
+
+    let multiplier: u64 = match kind {
+        ReconnectFailureKind::Transient => 2,
+        ReconnectFailureKind::Noisy => 3,
+        ReconnectFailureKind::Fatal => 1,
+    };
+
+    let current_ms = current.as_millis() as u64;
+    let mut next_ms = current_ms.saturating_mul(multiplier);
+    if next_ms == 0 {
+        next_ms = RECONNECT_MIN_BACKOFF.as_millis() as u64;
+    }
+    let capped = Duration::from_millis(next_ms).min(RECONNECT_MAX_BACKOFF);
+    let jittered = jittered_backoff(capped);
+    if jittered < RECONNECT_MIN_BACKOFF {
+        RECONNECT_MIN_BACKOFF
+    } else {
+        jittered
+    }
+}
+
 #[derive(Eq, PartialEq, Copy, Clone)]
 pub(crate) enum NeoCamThreadState {
     Connected,
@@ -112,6 +200,7 @@ impl NeoCamThread {
     async fn run_camera(&mut self, config: &CameraConfig) -> AnyResult<()> {
         let name = config.name.clone();
         log::debug!("{}: Attempting connection", name);
+        log::info!("METRIC camera={} event=connect_attempt", name);
         let connect_start = std::time::Instant::now();
         let camera = Arc::new(connect_and_login(config).await?);
         let connect_elapsed = connect_start.elapsed();
@@ -119,6 +208,11 @@ impl NeoCamThread {
             "{}: Connected to camera in {:.1}s",
             name,
             connect_elapsed.as_secs_f64()
+        );
+        log::info!(
+            "METRIC camera={} event=connect_success connect_ms={:.1}",
+            name,
+            connect_elapsed.as_secs_f64() * 1000.0
         );
         log::info!(
             "{}: Connection status=healthy, idle_disconnect={}, update_time={}, update_to={}s",
@@ -171,7 +265,18 @@ impl NeoCamThread {
                                 ping_ok,
                                 ping_timeout,
                                 ping_unintelligible + ping_other,
-                                ping_latency.format_ms(),
+                                format_ping_latency_metrics(&ping_latency),
+                                missed_pings,
+                                MAX_MISSED_PINGS
+                            );
+                            log::info!(
+                                "METRIC camera={} event=health uptime_ms={} ping_ok={} ping_timeout={} ping_bad_reply={} ping_rtt_ms={} consecutive_failures={} max_missed_pings={}",
+                                name,
+                                session_start.elapsed().as_millis(),
+                                ping_ok,
+                                ping_timeout,
+                                ping_unintelligible + ping_other,
+                                format_ping_latency_metrics(&ping_latency),
                                 missed_pings,
                                 MAX_MISSED_PINGS
                             );
@@ -256,7 +361,16 @@ impl NeoCamThread {
                         ping_ok,
                         ping_timeout,
                         ping_unintelligible + ping_other,
-                        ping_latency.format_ms()
+                        format_ping_latency_metrics(&ping_latency)
+                    );
+                    log::info!(
+                        "METRIC camera={} event=session_end outcome=degraded uptime_ms={} ping_ok={} ping_timeout={} ping_bad_reply={} ping_rtt_ms={}",
+                        name,
+                        session_start.elapsed().as_millis(),
+                        ping_ok,
+                        ping_timeout,
+                        ping_unintelligible + ping_other,
+                        format_ping_latency_metrics(&ping_latency)
                     );
                     log::debug!("{}: camera session ended with error: {:?}", name, e);
                 } else {
@@ -267,7 +381,16 @@ impl NeoCamThread {
                         ping_ok,
                         ping_timeout,
                         ping_unintelligible + ping_other,
-                        ping_latency.format_ms()
+                        format_ping_latency_metrics(&ping_latency)
+                    );
+                    log::info!(
+                        "METRIC camera={} event=session_end outcome=normal uptime_ms={} ping_ok={} ping_timeout={} ping_bad_reply={} ping_rtt_ms={}",
+                        name,
+                        session_start.elapsed().as_millis(),
+                        ping_ok,
+                        ping_timeout,
+                        ping_unintelligible + ping_other,
+                        format_ping_latency_metrics(&ping_latency)
                     );
                 }
                 v
@@ -281,7 +404,16 @@ impl NeoCamThread {
             ping_ok,
             ping_timeout,
             ping_unintelligible + ping_other,
-            ping_latency.format_ms()
+            format_ping_latency_metrics(&ping_latency)
+        );
+        log::info!(
+            "METRIC camera={} event=session_closed uptime_ms={} ping_ok={} ping_timeout={} ping_bad_reply={} ping_rtt_ms={}",
+            name,
+            session_start.elapsed().as_millis(),
+            ping_ok,
+            ping_timeout,
+            ping_unintelligible + ping_other,
+            format_ping_latency_metrics(&ping_latency)
         );
         let _ = camera.logout().await;
         let _ = camera.shutdown().await;
@@ -295,11 +427,8 @@ impl NeoCamThread {
     // whenever it changes
     pub(crate) async fn run(&mut self) -> AnyResult<()> {
         // Reconnect backoff covers camera reboot time (30-90s).
-        // Geometric series: 0.5 + 1 + 2 + 4 + 8 + 15 = 30.5s to cover the window.
-        const MAX_BACKOFF: Duration = Duration::from_secs(15);
-        const MIN_BACKOFF: Duration = Duration::from_millis(500);
-
-        let mut backoff = MIN_BACKOFF;
+        // Geometric series with jitter prevents reconnect storms when cameras flap.
+        let mut backoff = RECONNECT_MIN_BACKOFF;
 
         loop {
             self.state
@@ -339,13 +468,7 @@ impl NeoCamThread {
             // Else we see what the result actually was
             let result = res.unwrap();
 
-            if now.elapsed() > Duration::from_secs(60) {
-                // Command ran long enough to be considered a success
-                backoff = MIN_BACKOFF;
-            }
-            if backoff > MAX_BACKOFF {
-                backoff = MAX_BACKOFF;
-            }
+            let session_uptime = now.elapsed();
 
             match result {
                 Ok(()) => {
@@ -368,9 +491,17 @@ impl NeoCamThread {
                         _ => {
                             // Non fatal
                             log::warn!("{name}: Connection Lost: {:?}", e);
+                            let kind = classify_reconnect_failure(&e);
+                            backoff = next_backoff_delay(backoff, kind, session_uptime);
+                            log::info!(
+                                "METRIC camera={} event=reconnect failure_kind={:?} session_uptime_ms={} backoff_ms={}",
+                                name,
+                                kind,
+                                session_uptime.as_millis(),
+                                backoff.as_millis()
+                            );
                             log::info!("{name}: Attempt reconnect in {:?}", backoff);
                             sleep(backoff).await;
-                            backoff *= 2;
                         }
                     }
                 }
