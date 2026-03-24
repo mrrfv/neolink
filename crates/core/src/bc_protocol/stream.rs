@@ -47,8 +47,12 @@ fn stream_handle(msg_num: u16, stream: StreamKind) -> u32 {
 
 /// If the stream socket stays open but no media arrives, treat that as a hard failure.
 const STREAM_NO_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Warn if the stream has been idle this long but has not yet hit the hard-fail timeout.
+const STREAM_NO_FRAME_WARN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Emit a compact stream health summary at this cadence.
 const STREAM_HEALTH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Check for short-lived stalls at this cadence.
+const STREAM_STALL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Maximum time to wait for a stream stop acknowledgement.
 const STOP_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -224,10 +228,12 @@ impl BcCamera {
             {
                 let mut media_sub = sub_video.bcmedia_stream(strict);
                 let mut stream_health = interval(STREAM_HEALTH_LOG_INTERVAL);
+                let mut stall_check = interval(STREAM_STALL_CHECK_INTERVAL);
                 let mut frames_total: usize = 0;
                 let mut frames_video: usize = 0;
                 let mut frames_audio: usize = 0;
                 let mut last_media = std::time::Instant::now();
+                let mut stall_warned = false;
                 let stream_started = std::time::Instant::now();
 
                 tokio::select! {
@@ -245,9 +251,22 @@ impl BcCamera {
                                         last_media.elapsed()
                                     );
                                 }
+                                _ = stall_check.tick() => {
+                                    if !stall_warned && last_media.elapsed() >= STREAM_NO_FRAME_WARN_TIMEOUT {
+                                        stall_warned = true;
+                                        log::warn!(
+                                            "{camera_name}::{stream:?}: stream idle for {:?} without media yet (video={}, audio={}), will reconnect if this reaches {:?}",
+                                            last_media.elapsed(),
+                                            frames_video,
+                                            frames_audio,
+                                            STREAM_NO_FRAME_TIMEOUT
+                                        );
+                                    }
+                                }
                                 media = timeout(STREAM_NO_FRAME_TIMEOUT, media_sub.next()) => {
                                     match media {
                                         Ok(Some(bc_media)) => {
+                                            stall_warned = false;
                                             frames_total += 1;
                                             if let Ok(ref media) = bc_media {
                                                 match media {
