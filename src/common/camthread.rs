@@ -77,6 +77,13 @@ impl NeoCamThread {
             name,
             connect_elapsed.as_secs_f64()
         );
+        log::info!(
+            "{}: Connection status=healthy, idle_disconnect={}, update_time={}, update_to={}s",
+            name,
+            config.idle_disconnect,
+            config.update_time,
+            config.pause.motion_timeout
+        );
 
         sleep(CAMERA_WAKEUP_DELAY).await;
         if let Err(e) = update_camera_time(&camera, &name, config.update_time).await {
@@ -90,6 +97,13 @@ impl NeoCamThread {
         self.camera_watch.send_replace(Arc::downgrade(&camera));
 
         let cancel_check = self.cancel.clone();
+        let mut health_tick = interval(Duration::from_secs(60));
+        health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ping_ok = 0usize;
+        let mut ping_timeout = 0usize;
+        let mut ping_unintelligible = 0usize;
+        let mut ping_other = 0usize;
+        let session_start = Instant::now();
         // Now we wait for a disconnect
         tokio::select! {
             _ = cancel_check.cancelled() => {
@@ -101,53 +115,124 @@ impl NeoCamThread {
             },
             v = async {
                 let mut ping_interval = interval(PING_INTERVAL);
+                ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut missed_pings = 0;
                 loop {
-                    ping_interval.tick().await;
-                    log::trace!("Sending ping");
-                    match timeout(PING_TIMEOUT, camera.get_linktype()).await {
-                        Ok(Ok(_)) => {
-                            log::trace!("Ping reply received");
-                            missed_pings = 0;
-                            continue
-                        },
-                        Ok(Err(neolink_core::Error::UnintelligibleReply { reply, why })) => {
-                            log::warn!(
-                                "{}: Unintelligible ping reply from camera: {reply:?}: {why}",
-                                name
+                    tokio::select! {
+                        _ = health_tick.tick() => {
+                            log::info!(
+                                "{}: Connection status=healthy, uptime={:?}, ping_ok={}, ping_timeout={}, ping_bad_reply={}, consecutive_failures={}/{}",
+                                name,
+                                session_start.elapsed(),
+                                ping_ok,
+                                ping_timeout,
+                                ping_unintelligible + ping_other,
+                                missed_pings,
+                                MAX_MISSED_PINGS
                             );
-                            missed_pings += 1;
-                            if missed_pings < MAX_MISSED_PINGS {
-                                continue;
-                            } else {
-                                log::error!(
-                                    "Timed out waiting for camera ping reply ({} consecutive failures)",
-                                    missed_pings
-                                );
-                                break Err(anyhow::anyhow!(
-                                    "Timed out waiting for camera ping reply"
-                                ));
-                            }
-                        },
-                        Ok(Err(e)) => {
-                            break Err(e.into());
-                        },
-                        Err(_) => {
-                            // Timeout
-                            missed_pings += 1;
-                            if missed_pings < MAX_MISSED_PINGS {
-                                log::debug!("Ping timeout ({}/{}), will retry", missed_pings, MAX_MISSED_PINGS);
-                                continue;
-                            } else {
-                                log::error!("Timed out waiting for camera ping reply ({} consecutive failures)", missed_pings);
-                                break Err(anyhow::anyhow!("Timed out waiting for camera ping reply"));
+                        }
+                        _ = ping_interval.tick() => {
+                            log::trace!("Sending ping");
+                            match timeout(PING_TIMEOUT, camera.get_linktype()).await {
+                                Ok(Ok(_)) => {
+                                    ping_ok += 1;
+                                    log::trace!("Ping reply received");
+                                    missed_pings = 0;
+                                    continue
+                                },
+                                Ok(Err(neolink_core::Error::UnintelligibleReply { reply, why })) => {
+                                    ping_unintelligible += 1;
+                                    log::warn!(
+                                        "{}: Unintelligible ping reply from camera: {reply:?}: {why}",
+                                        name
+                                    );
+                                    missed_pings += 1;
+                                    if missed_pings < MAX_MISSED_PINGS {
+                                        continue;
+                                    } else {
+                                        log::error!(
+                                            "{}: ping health failed after {} consecutive bad replies (ok={}, timeout={}, bad_reply={})",
+                                            name,
+                                            missed_pings,
+                                            ping_ok,
+                                            ping_timeout,
+                                            ping_unintelligible + ping_other
+                                        );
+                                        break Err(anyhow::anyhow!(
+                                            "Timed out waiting for camera ping reply"
+                                        ));
+                                    }
+                                },
+                                Ok(Err(e)) => {
+                                    ping_other += 1;
+                                    log::warn!(
+                                        "{}: Ping failed with camera error: {:?}",
+                                        name,
+                                        e
+                                    );
+                                    break Err(e.into());
+                                },
+                                Err(_) => {
+                                    // Timeout
+                                    ping_timeout += 1;
+                                    missed_pings += 1;
+                                    if missed_pings < MAX_MISSED_PINGS {
+                                        log::debug!(
+                                            "{}: Ping timeout ({}/{}), will retry",
+                                            name,
+                                            missed_pings,
+                                            MAX_MISSED_PINGS
+                                        );
+                                        continue;
+                                    } else {
+                                        log::error!(
+                                            "{}: ping health failed after {} consecutive timeouts (ok={}, timeout={}, bad_reply={})",
+                                            name,
+                                            missed_pings,
+                                            ping_ok,
+                                            ping_timeout,
+                                            ping_unintelligible + ping_other
+                                        );
+                                        break Err(anyhow::anyhow!("Timed out waiting for camera ping reply"));
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            } => v,
+            } => {
+                if let Err(ref e) = v {
+                    log::warn!(
+                        "{}: Connection status=degraded, uptime={:?}, ping_ok={}, ping_timeout={}, ping_bad_reply={}",
+                        name,
+                        session_start.elapsed(),
+                        ping_ok,
+                        ping_timeout,
+                        ping_unintelligible + ping_other
+                    );
+                    log::debug!("{}: camera session ended with error: {:?}", name, e);
+                } else {
+                    log::info!(
+                        "{}: Connection status=ended normally, uptime={:?}, ping_ok={}, ping_timeout={}, ping_bad_reply={}",
+                        name,
+                        session_start.elapsed(),
+                        ping_ok,
+                        ping_timeout,
+                        ping_unintelligible + ping_other
+                    );
+                }
+                v
+            },
         }?;
 
+        log::info!(
+            "{}: Camera session closed cleanly after {:?} (ping_ok={}, ping_timeout={}, ping_bad_reply={})",
+            name,
+            session_start.elapsed(),
+            ping_ok,
+            ping_timeout,
+            ping_unintelligible + ping_other
+        );
         let _ = camera.logout().await;
         let _ = camera.shutdown().await;
 

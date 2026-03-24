@@ -6,6 +6,7 @@ use crate::{
 use futures::stream::StreamExt;
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio::task::{self, JoinHandle};
+use tokio::time::{interval, timeout};
 use tokio_util::sync::CancellationToken;
 
 /// The stream names supported by BC
@@ -43,6 +44,14 @@ fn stream_handle(msg_num: u16, stream: StreamKind) -> u32 {
         StreamKind::Extern => 2,
     }
 }
+
+/// If the stream socket stays open but no media arrives, treat that as a hard failure.
+const STREAM_NO_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Emit a compact stream health summary at this cadence.
+const STREAM_HEALTH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Maximum time to wait for a stream stop acknowledgement.
+const STOP_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A handle on currently streaming data
 ///
@@ -141,6 +150,7 @@ impl BcCamera {
 
         let connection = self.get_connection();
         let msg_num = self.new_message_num();
+        let camera_name = self.name.clone();
 
         let abort_handle = CancellationToken::new();
         let abort_handle_thread = abort_handle.clone();
@@ -213,18 +223,75 @@ impl BcCamera {
 
             {
                 let mut media_sub = sub_video.bcmedia_stream(strict);
+                let mut stream_health = interval(STREAM_HEALTH_LOG_INTERVAL);
+                let mut frames_total: usize = 0;
+                let mut frames_video: usize = 0;
+                let mut frames_audio: usize = 0;
+                let mut last_media = std::time::Instant::now();
+                let stream_started = std::time::Instant::now();
 
                 tokio::select! {
                     _ = abort_handle_thread.cancelled() => {},
                     _ = async {
-                        while let Some(bc_media) = media_sub.next().await {
-                            // We now have a complete interesting packet. Send it to on the callback
-                            if tx.send(bc_media).await.is_err() {
-                                break; // Connection dropped
+                        let result: Result<()> = loop {
+                            tokio::select! {
+                                _ = stream_health.tick() => {
+                                    log::info!(
+                                        "{camera_name}::{stream:?}: stream healthy: total={}, video={}, audio={}, alive_for={:?}, idle_for={:?}",
+                                        frames_total,
+                                        frames_video,
+                                        frames_audio,
+                                        stream_started.elapsed(),
+                                        last_media.elapsed()
+                                    );
+                                }
+                                media = timeout(STREAM_NO_FRAME_TIMEOUT, media_sub.next()) => {
+                                    match media {
+                                        Ok(Some(bc_media)) => {
+                                            frames_total += 1;
+                                            if let Ok(ref media) = bc_media {
+                                                match media {
+                                                    BcMedia::Iframe(_) | BcMedia::Pframe(_) => {
+                                                        frames_video += 1;
+                                                    }
+                                                    BcMedia::Aac(_) | BcMedia::Adpcm(_) => {
+                                                        frames_audio += 1;
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            last_media = std::time::Instant::now();
+                                            // We now have a complete interesting packet. Send it to on the callback.
+                                            if tx.send(bc_media).await.is_err() {
+                                                break Ok(());
+                                            }
+                                        }
+                                        Ok(None) => break Ok(()),
+                                        Err(_) => {
+                                            log::warn!(
+                                                "{camera_name}::{stream:?}: stream stalled: no media for {:?} after {} frames (video={}, audio={}), rebuilding session",
+                                                STREAM_NO_FRAME_TIMEOUT,
+                                                frames_total,
+                                                frames_video,
+                                                frames_audio
+                                            );
+                                            break Err(Error::TimeoutDisconnected);
+                                        }
+                                    }
+                                }
                             }
-                        }
+                        };
+                        result
                     } => {}
                 }
+
+                log::info!(
+                    "{camera_name}::{stream:?}: stream ended: total={}, video={}, audio={}, alive_for={:?}",
+                    frames_total,
+                    frames_video,
+                    frames_audio,
+                    stream_started.elapsed()
+                );
             }
 
             let stop_video = Bc::new_from_xml(
@@ -346,7 +413,9 @@ impl BcCamera {
 
         sub_video.send(stop_video).await?;
 
-        let reply = sub_video.recv().await?;
+        let reply = timeout(STOP_ACK_TIMEOUT, sub_video.recv())
+            .await
+            .map_err(|_| Error::TimeoutDisconnected)??;
         if reply.meta.response_code != 200 {
             return Err(Error::CameraServiceUnavailable {
                 id: reply.meta.msg_id,

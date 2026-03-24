@@ -19,6 +19,7 @@ use rand::{seq::SliceRandom, thread_rng, Rng};
 use std::collections::{btree_map::Entry, BTreeMap, HashSet};
 use std::convert::TryInto;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::time::MissedTickBehavior;
 use tokio::{
@@ -90,9 +91,78 @@ lazy_static! {
 
 }
 
-type Subscriber = Arc<RwLock<BTreeMap<u32, Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
-type Handlers = Arc<RwLock<Vec<Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
+type DiscoveryMessage = Result<(UdpDiscovery, SocketAddr)>;
+type Subscriber = Arc<RwLock<BTreeMap<u32, SubscriptionEntry<DiscoveryMessage>>>>;
+type Handlers = Arc<RwLock<Vec<SubscriptionEntry<DiscoveryMessage>>>>;
 type ArcFramedSocket = UdpFramed<BcUdpCodex, Arc<UdpSocket>>;
+
+#[derive(Clone)]
+struct SubscriptionEntry<T> {
+    token: u64,
+    sender: Sender<T>,
+}
+
+enum DiscoverySubscriptionCleanup {
+    Tid {
+        subs: Subscriber,
+        tid: u32,
+        token: u64,
+    },
+    Handler {
+        handlers: Handlers,
+        token: u64,
+    },
+}
+
+impl DiscoverySubscriptionCleanup {
+    async fn cleanup(self) {
+        match self {
+            DiscoverySubscriptionCleanup::Tid { subs, tid, token } => {
+                let mut subs = subs.write().await;
+                let should_remove = subs.get(&tid).is_some_and(|entry| entry.token == token);
+                if should_remove {
+                    subs.remove(&tid);
+                }
+            }
+            DiscoverySubscriptionCleanup::Handler { handlers, token } => {
+                let mut handlers = handlers.write().await;
+                if let Some(idx) = handlers.iter().position(|entry| entry.token == token) {
+                    handlers.remove(idx);
+                }
+            }
+        }
+    }
+}
+
+struct DiscoverySubscription {
+    receiver: Option<Receiver<DiscoveryMessage>>,
+    cleanup: Option<DiscoverySubscriptionCleanup>,
+}
+
+impl Stream for DiscoverySubscription {
+    type Item = DiscoveryMessage;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.receiver
+            .as_mut()
+            .expect("subscription receiver missing")
+            .poll_recv(cx)
+    }
+}
+
+impl Drop for DiscoverySubscription {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(cleanup.cleanup());
+            }
+        }
+    }
+}
+
 pub(crate) struct Discoverer {
     semaphore: Arc<Semaphore>,
     socket: Arc<UdpSocket>,
@@ -102,6 +172,7 @@ pub(crate) struct Discoverer {
     handlers: Handlers,
     local_addr: SocketAddr,
     cancel: CancellationToken,
+    subscription_seq: AtomicU64,
 }
 
 fn valid_ip(ip: &str) -> bool {
@@ -141,18 +212,19 @@ impl Discoverer {
                             Some(Ok((BcUdp::Discovery(bcudp), addr))) => {
                                 log::trace!("Got discovery {:?} for {}", bcudp, addr);
                                 let tid = bcudp.tid;
-                                let mut needs_removal = false;
-                                if let (Some(sender), true) =
-                                    (thread_subscriber.read().await.get(&tid), tid > 0)
+                                let mut removal_token = None;
+                                if let (Some(entry), true) =
+                                    (thread_subscriber.read().await.get(&tid).cloned(), tid > 0)
                                 {
-                                    if sender.send(Ok((bcudp, addr))).await.is_err() {
-                                        needs_removal = true;
+                                    if entry.sender.send(Ok((bcudp, addr))).await.is_err() {
+                                        removal_token = Some(entry.token);
                                     }
                                 } else {
                                     let mut handlers = thread_handlers.write().await;
                                     let mut idx = 0;
                                     while idx < handlers.len() {
                                         if handlers[idx]
+                                            .sender
                                             .send(Ok((bcudp.clone(), addr)))
                                             .await
                                             .is_err()
@@ -163,8 +235,11 @@ impl Discoverer {
                                         }
                                     }
                                 }
-                                if needs_removal {
-                                    thread_subscriber.write().await.remove(&tid);
+                                if let Some(token) = removal_token {
+                                    let mut locked = thread_subscriber.write().await;
+                                    if locked.get(&tid).is_some_and(|entry| entry.token == token) {
+                                        locked.remove(&tid);
+                                    }
                                 }
                             }
                             Some(Ok(bcudp)) => {
@@ -175,7 +250,7 @@ impl Discoverer {
                                 log::error!("Error on discovery socket: {:?}", e);
                                 let mut locked_sub = thread_subscriber.write().await;
                                 for (_, sub) in locked_sub.iter() {
-                                    let _ = sub.send(Err(e.clone())).await;
+                                    let _ = sub.sender.send(Err(e.clone())).await;
                                 }
                                 locked_sub.clear();
                                 break Result::Ok(());
@@ -211,27 +286,47 @@ impl Discoverer {
             handlers,
             local_addr,
             cancel,
+            subscription_seq: AtomicU64::new(1),
         })
+    }
+
+    fn next_subscription_token(&self) -> u64 {
+        self.subscription_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     async fn get_socket(&self) -> Arc<UdpSocket> {
         self.socket.clone()
     }
 
-    async fn subscribe(&self, tid: u32) -> Result<Receiver<Result<(UdpDiscovery, SocketAddr)>>> {
+    async fn subscribe(&self, tid: u32) -> Result<DiscoverySubscription> {
         if tid > 0 {
+            let token = self.next_subscription_token();
             let mut subs = self.subsribers.write().await;
             match subs.entry(tid) {
                 Entry::Vacant(vacant) => {
                     let (tx, rx) = channel(10);
-                    vacant.insert(tx);
-                    Ok(rx)
+                    vacant.insert(SubscriptionEntry { token, sender: tx });
+                    Ok(DiscoverySubscription {
+                        receiver: Some(rx),
+                        cleanup: Some(DiscoverySubscriptionCleanup::Tid {
+                            subs: self.subsribers.clone(),
+                            tid,
+                            token,
+                        }),
+                    })
                 }
                 Entry::Occupied(mut occ) => {
-                    if occ.get().is_closed() {
+                    if occ.get().sender.is_closed() {
                         let (tx, rx) = channel(10);
-                        occ.insert(tx);
-                        Ok(rx)
+                        occ.insert(SubscriptionEntry { token, sender: tx });
+                        Ok(DiscoverySubscription {
+                            receiver: Some(rx),
+                            cleanup: Some(DiscoverySubscriptionCleanup::Tid {
+                                subs: self.subsribers.clone(),
+                                tid,
+                                token,
+                            }),
+                        })
                     } else {
                         // log::error!("Failed to subscribe in discovery to {:?}", tid);
                         Err(Error::SimultaneousSubscription {
@@ -242,10 +337,17 @@ impl Discoverer {
             }
         } else {
             // If tid is zero we listen to all!
+            let token = self.next_subscription_token();
             let mut handlers = self.handlers.write().await;
             let (tx, rx) = channel(10);
-            handlers.push(tx);
-            Ok(rx)
+            handlers.push(SubscriptionEntry { token, sender: tx });
+            Ok(DiscoverySubscription {
+                receiver: Some(rx),
+                cleanup: Some(DiscoverySubscriptionCleanup::Handler {
+                    handlers: self.handlers.clone(),
+                    token,
+                }),
+            })
         }
     }
 
@@ -256,7 +358,7 @@ impl Discoverer {
     where
         F: Fn(UdpDiscovery, SocketAddr) -> Option<T>,
     {
-        let mut reply = ReceiverStream::new(self.subscribe(0).await?);
+        let mut reply = self.subscribe(0).await?;
         tokio::select! {
             v = async {
                 loop {
@@ -294,7 +396,7 @@ impl Discoverer {
             disc.tid
         };
 
-        let mut reply = ReceiverStream::new(self.subscribe(target_tid).await?);
+        let mut reply = self.subscribe(target_tid).await?;
         let msg = BcUdp::Discovery(disc);
 
         let mut inter = interval(*RESEND_WAIT);
