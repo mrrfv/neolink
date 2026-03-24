@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -12,7 +13,12 @@ use neolink_core::{
         BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe, VideoType,
     },
 };
-use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle, time::timeout};
+use tokio::{
+    sync::mpsc::{channel as mpsc, error::TryRecvError},
+    task::JoinHandle,
+    time::{interval, timeout},
+};
+use tokio_util::sync::CancellationToken;
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
 
@@ -65,6 +71,10 @@ const MAX_BOOTSTRAP_FRAMES: usize = 256;
 const REOPEN_MAX_RETRIES: u32 = 10;
 /// Maximum delay between reopen attempts (exponential backoff cap).
 const REOPEN_MAX_DELAY: Duration = Duration::from_secs(30);
+/// If a client sender thread makes no progress for this long, cancel it and let the client reconnect.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+/// How often to sweep stale RTSP clients when the camera is quiet.
+const CLIENT_REAP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -190,6 +200,8 @@ enum ClientMsg {
 struct ClientState {
     sender: tokio::sync::mpsc::Sender<BcMedia>,
     thread_handle: Option<std::thread::JoinHandle<AnyResult<()>>>,
+    cancel: CancellationToken,
+    last_activity: Arc<Mutex<Instant>>,
 }
 
 #[derive(Default)]
@@ -213,7 +225,9 @@ fn buffer_media(buffer: &mut Vec<BcMedia>, media: BcMedia) {
     buffer.push(media);
 
     if buffer.len() > MAX_BOOTSTRAP_FRAMES {
-        if let Some(last_iframe) = buffer.iter().rposition(|item| matches!(item, BcMedia::Iframe(_)))
+        if let Some(last_iframe) = buffer
+            .iter()
+            .rposition(|item| matches!(item, BcMedia::Iframe(_)))
         {
             if last_iframe > 0 {
                 let _ = buffer.drain(0..last_iframe);
@@ -223,6 +237,72 @@ fn buffer_media(buffer: &mut Vec<BcMedia>, media: BcMedia) {
         let drain_count = buffer.len().saturating_sub(MAX_BOOTSTRAP_FRAMES / 2);
         let _ = buffer.drain(0..drain_count);
     }
+}
+
+fn touch_client_activity(last_activity: &Arc<Mutex<Instant>>) {
+    if let Ok(mut guard) = last_activity.lock() {
+        *guard = Instant::now();
+    }
+}
+
+fn reap_finished_handles(handles: &mut Vec<std::thread::JoinHandle<AnyResult<()>>>, label: &str) {
+    let mut still_running = Vec::with_capacity(handles.len());
+    for handle in handles.drain(..) {
+        if handle.is_finished() {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    log::debug!("{label}: sender thread exited with error: {e:?}");
+                }
+                Err(e) => {
+                    log::warn!("{label}: sender thread panicked: {e:?}");
+                }
+            }
+        } else {
+            still_running.push(handle);
+        }
+    }
+    *handles = still_running;
+}
+
+fn reap_stale_clients(
+    clients: &mut Vec<ClientState>,
+    old_thread_handles: &mut Vec<std::thread::JoinHandle<AnyResult<()>>>,
+    stream_name: &str,
+) {
+    let mut still_open = Vec::with_capacity(clients.len());
+    let now = Instant::now();
+
+    for client in clients.drain(..) {
+        let stale = client
+            .last_activity
+            .lock()
+            .map(|last| now.duration_since(*last) > CLIENT_IDLE_TIMEOUT)
+            .unwrap_or(true);
+        let finished = client
+            .thread_handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished);
+
+        if stale {
+            log::info!(
+                "{stream_name}: cancelling stale RTSP client after {:?} of inactivity",
+                CLIENT_IDLE_TIMEOUT
+            );
+            client.cancel.cancel();
+        }
+
+        if finished || stale {
+            if let Some(handle) = client.thread_handle {
+                old_thread_handles.push(handle);
+            }
+        } else {
+            still_open.push(client);
+        }
+    }
+
+    *clients = still_open;
+    reap_finished_handles(old_thread_handles, stream_name);
 }
 
 fn should_drop_for_backpressure(media: &BcMedia) -> bool {
@@ -273,9 +353,7 @@ pub(super) async fn make_factory(
             let mut media_rx = match camera.stream_while_live(stream).await {
                 Ok(media_rx) => media_rx,
                 Err(e) => {
-                    log::warn!(
-                        "{name}::{stream}: failed to start camera stream, retrying: {e:?}"
-                    );
+                    log::warn!("{name}::{stream}: failed to start camera stream, retrying: {e:?}");
                     tokio::time::sleep(STREAM_RETRY_DELAY).await;
                     continue;
                 }
@@ -336,9 +414,13 @@ pub(super) async fn make_factory(
         // Shared flag: set by main loop on stream reconnect, read by sender threads
         // to reset their TimestampState and avoid non-monotonic DTS.
         let timestamps_reset_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut client_reap = interval(CLIENT_REAP_INTERVAL);
 
         loop {
             tokio::select! {
+                _ = client_reap.tick() => {
+                    reap_stale_clients(&mut clients, &mut old_thread_handles, &name);
+                }
                 media_opt = tokio::time::timeout(STREAM_STALL_TIMEOUT, media_rx.recv()) => {
                     match media_opt {
                         Ok(Some(media)) => {
@@ -367,6 +449,7 @@ pub(super) async fn make_factory(
                                 for client in clients.drain(..) {
                                     match client.sender.try_send(media.clone()) {
                                         Ok(()) => {
+                                            touch_client_activity(&client.last_activity);
                                             delivered = true;
                                             still_open.push(client);
                                         }
@@ -380,18 +463,21 @@ pub(super) async fn make_factory(
                                             };
                                             if drop_ok {
                                                 log::debug!(
-                                                    "OBSERVE: Queue-full drop stream={} media={} (Client Fanout)", stream, media_type
-                                                );
+                                                "OBSERVE: Queue-full drop stream={} media={} (Client Fanout)", stream, media_type
+                                            );
+                                                touch_client_activity(&client.last_activity);
                                                 still_open.push(client);
                                             } else if is_keyframe(&media) {
                                                 log::warn!(
                                                     "OBSERVE: Queue-full drop stream={} media={} (Client Fanout). Dropping keyframe but keeping client.", stream, media_type
                                                 );
+                                                touch_client_activity(&client.last_activity);
                                                 still_open.push(client);
                                             } else {
                                                 log::warn!(
                                                     "OBSERVE: Queue-full drop stream={} media={} (Client Fanout). Backpressure on non-droppable.", stream, media_type
                                                 );
+                                                touch_client_activity(&client.last_activity);
                                                 still_open.push(client);
                                             }
                                         }
@@ -408,7 +494,7 @@ pub(super) async fn make_factory(
                                 clients = still_open;
 
                                 // Join any finished old sender threads to reclaim resources
-                                old_thread_handles.retain(|h| !h.is_finished());
+                                reap_finished_handles(&mut old_thread_handles, &name);
 
                                 if delivered {
                                     continue;
@@ -513,6 +599,8 @@ pub(super) async fn make_factory(
 
                         let (tx, mut rx) =
                             tokio::sync::mpsc::channel(CLIENT_MEDIA_QUEUE_CAPACITY);
+                        let client_cancel = CancellationToken::new();
+                        let client_last_activity = Arc::new(Mutex::new(Instant::now()));
 
                         let mut to_send = buffer.clone();
                         let bootstrap_needs_keyframe = prepare_bootstrap_batch(&mut to_send);
@@ -521,6 +609,8 @@ pub(super) async fn make_factory(
                         let thread_name = format!("{sender_name}::{stream}::sender");
                         let stream_config_clone = stream_config.clone();
                         let thread_ts_reset = timestamps_reset_flag.clone();
+                        let thread_cancel = client_cancel.clone();
+                        let thread_last_activity = client_last_activity.clone();
                         let thread_handle = std::thread::Builder::new()
                             .name(thread_name)
                             .spawn(move || {
@@ -529,7 +619,13 @@ pub(super) async fn make_factory(
                                 let mut pools = Default::default();
                                 let mut waiting_for_keyframe = bootstrap_needs_keyframe;
 
-                                if let Err(e) = wait_for_sources_ready(&vid_src, &aud_src, &name, &stream.to_string()) {
+                                if let Err(e) = wait_for_sources_ready(
+                                    &vid_src,
+                                    &aud_src,
+                                    &name,
+                                    &stream.to_string(),
+                                    &thread_cancel,
+                                ) {
                                     log::warn!(
                                         "{name}::{stream}: RTSP pipeline did not become live in time: {e:?}"
                                     );
@@ -539,6 +635,7 @@ pub(super) async fn make_factory(
                                 'sender_loop: {
                                     log::trace!("Sending buffered frames");
                                     for buffered in to_send.drain(..) {
+                                        touch_client_activity(&thread_last_activity);
                                         if waiting_for_keyframe {
                                             if !is_keyframe(&buffered) {
                                                 continue;
@@ -568,8 +665,9 @@ pub(super) async fn make_factory(
                                     }
 
                                     log::trace!("Sending new frames");
-                                while let Some(mut batch) = drain_latest_batch(&mut rx) {
+                                while let Some(mut batch) = drain_latest_batch_with_cancel(&mut rx, &thread_cancel) {
                                     for data in batch.drain(..) {
+                                        touch_client_activity(&thread_last_activity);
                                         // Check if the main loop signaled a stream reconnect
                                         if thread_ts_reset.load(std::sync::atomic::Ordering::Relaxed) {
                                             log::info!("{name}::{stream}: Resetting timestamps after stream reconnect");
@@ -615,7 +713,12 @@ pub(super) async fn make_factory(
                             log::error!("Failed to spawn frame sender thread");
                         }
 
-                        clients.push(ClientState { sender: tx, thread_handle });
+                        clients.push(ClientState {
+                            sender: tx,
+                            thread_handle,
+                            cancel: client_cancel,
+                            last_activity: client_last_activity,
+                        });
                     } else {
                         break;
                     }
@@ -624,15 +727,15 @@ pub(super) async fn make_factory(
         }
         // Clean up: join all remaining sender threads to prevent resource leaks
         for client in clients.drain(..) {
+            client.cancel.cancel();
             if let Some(handle) = client.thread_handle {
-                if handle.is_finished() {
-                    let _ = handle.join();
-                }
+                old_thread_handles.push(handle);
             }
         }
-        for handle in old_thread_handles.drain(..) {
-            if handle.is_finished() {
-                let _ = handle.join();
+        while !old_thread_handles.is_empty() {
+            reap_finished_handles(&mut old_thread_handles, &name);
+            if !old_thread_handles.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
         AnyResult::Ok(())
@@ -643,15 +746,21 @@ pub(super) async fn make_factory(
         // Use a SyncSender with a timeout so we don't block the RTSP server
         // indefinitely if the factory background task is busy reopening the camera stream
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        client_tx.try_send(ClientMsg::NewClient {
-            element: element.clone().upcast(),
-            reply: tx,
-        }).ok();
-        
+        client_tx
+            .try_send(ClientMsg::NewClient {
+                element: element.clone().upcast(),
+                reply: tx,
+            })
+            .ok();
+
         let element = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(Ok(e)) => e,
             Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(anyhow::anyhow!("Failed to receive new element from client thread: {e:?}")),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to receive new element from client thread: {e:?}"
+                ))
+            }
         };
         Ok(Some(element))
     })
@@ -673,7 +782,15 @@ fn send_to_sources(
                 if let Some(aud_src) = aud_src.as_ref() {
                     let pkt_duration = Duration::from_micros(duration as u64);
                     let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
-                    let _ = send_to_appsrc(aud_src, aac.data, ts, Some(pkt_duration), true, false, pools)?;
+                    let _ = send_to_appsrc(
+                        aud_src,
+                        aac.data,
+                        ts,
+                        Some(pkt_duration),
+                        true,
+                        false,
+                        pools,
+                    )?;
                 }
             }
             Ok(FrameSendOutcome::Sent)
@@ -683,15 +800,21 @@ fn send_to_sources(
                 if let Some(aud_src) = aud_src.as_ref() {
                     let pkt_duration = Duration::from_micros(duration as u64);
                     let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
-                    let _ = send_to_appsrc(aud_src, adpcm.data, ts, Some(pkt_duration), true, false, pools)?;
+                    let _ = send_to_appsrc(
+                        aud_src,
+                        adpcm.data,
+                        ts,
+                        Some(pkt_duration),
+                        true,
+                        false,
+                        pools,
+                    )?;
                 }
             }
             Ok(FrameSendOutcome::Sent)
         }
         BcMedia::Iframe(BcMediaIframe {
-            data,
-            microseconds,
-            ..
+            data, microseconds, ..
         }) => {
             let frame_interval = 1_000_000u64 / u64::from(stream_config.fps.max(1));
             if let Some(vid_src) = vid_src.as_ref() {
@@ -707,9 +830,7 @@ fn send_to_sources(
             Ok(FrameSendOutcome::Sent)
         }
         BcMedia::Pframe(BcMediaPframe {
-            data,
-            microseconds,
-            ..
+            data, microseconds, ..
         }) => {
             let frame_interval = 1_000_000u64 / u64::from(stream_config.fps.max(1));
             if let Some(vid_src) = vid_src.as_ref() {
@@ -759,7 +880,10 @@ fn next_video_timestamp(
             );
             fallback_increment
         }
-        Some(prev) if prev >= u32::MAX - VIDEO_TIMESTAMP_WRAP_WINDOW && source_ts <= VIDEO_TIMESTAMP_WRAP_WINDOW => {
+        Some(prev)
+            if prev >= u32::MAX - VIDEO_TIMESTAMP_WRAP_WINDOW
+                && source_ts <= VIDEO_TIMESTAMP_WRAP_WINDOW =>
+        {
             log::info!(
                 "OBSERVE: Timestamp wrap event source={} prev={}",
                 source_ts,
@@ -807,7 +931,7 @@ fn send_to_appsrc(
     while appsrc.current_level_bytes() >= threshold_bytes && retries < MAX_RETRIES {
         retries += 1;
         std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-        wait_ms *= 2; 
+        wait_ms *= 2;
     }
 
     if retries >= MAX_RETRIES {
@@ -846,16 +970,18 @@ fn send_to_appsrc(
         let gst_buf_mut = new_buf
             .get_mut()
             .ok_or_else(|| anyhow::anyhow!("Failed to get mutable buffer reference"))?;
-            
+
         let time = gstreamer::ClockTime::from_useconds(ts.as_micros() as u64);
         gst_buf_mut.set_pts(time);
         if !is_video {
             gst_buf_mut.set_dts(time);
         }
         if let Some(duration) = duration {
-            gst_buf_mut.set_duration(gstreamer::ClockTime::from_useconds(duration.as_micros() as u64));
+            gst_buf_mut.set_duration(gstreamer::ClockTime::from_useconds(
+                duration.as_micros() as u64
+            ));
         }
-        
+
         let mut gst_buf_data = gst_buf_mut
             .map_writable()
             .map_err(|e| anyhow::anyhow!("Failed to map buffer writable: {e:?}"))?;
@@ -872,9 +998,7 @@ fn send_to_appsrc(
     }
 }
 
-fn drain_latest_batch(
-    rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
-) -> Option<Vec<BcMedia>> {
+fn drain_latest_batch(rx: &mut tokio::sync::mpsc::Receiver<BcMedia>) -> Option<Vec<BcMedia>> {
     let first = rx.blocking_recv()?;
     let mut batch = vec![first];
     while let Ok(next) = rx.try_recv() {
@@ -886,12 +1010,44 @@ fn drain_latest_batch(
             let _ = batch.drain(0..last_iframe);
         }
     } else if batch.len() > 1 {
-        log::trace!(
-            "Drained RTSP batch without a keyframe; keeping latest media to avoid stalls"
-        );
+        log::trace!("Drained RTSP batch without a keyframe; keeping latest media to avoid stalls");
     }
 
     Some(batch)
+}
+
+fn drain_latest_batch_with_cancel(
+    rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
+    cancel: &CancellationToken,
+) -> Option<Vec<BcMedia>> {
+    loop {
+        if cancel.is_cancelled() {
+            return None;
+        }
+
+        match rx.try_recv() {
+            Ok(first) => {
+                let mut batch = vec![first];
+                while let Ok(next) = rx.try_recv() {
+                    batch.push(next);
+                }
+
+                if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
+                    if last_iframe > 0 {
+                        let _ = batch.drain(0..last_iframe);
+                    }
+                } else if batch.len() > 1 {
+                    log::trace!("Drained RTSP batch without a keyframe; keeping latest media to avoid stalls");
+                }
+
+                return Some(batch);
+            }
+            Err(TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(TryRecvError::Disconnected) => return None,
+        }
+    }
 }
 
 fn prepare_bootstrap_batch(batch: &mut Vec<BcMedia>) -> bool {
@@ -901,9 +1057,7 @@ fn prepare_bootstrap_batch(batch: &mut Vec<BcMedia>) -> bool {
         }
         false
     } else if batch.len() > 1 {
-        log::trace!(
-            "Trimming RTSP bootstrap without a keyframe to avoid startup lag"
-        );
+        log::trace!("Trimming RTSP bootstrap without a keyframe to avoid startup lag");
         if let Some(last) = batch.pop() {
             batch.clear();
             batch.push(last);
@@ -922,18 +1076,33 @@ fn check_live(app: &AppSrc) -> Result<()> {
         .ok_or(anyhow!("App source is not linked"))
 }
 
-fn wait_for_sources_ready(vid_src: &Option<AppSrc>, aud_src: &Option<AppSrc>, name: &str, stream: &str) -> Result<()> {
+fn wait_for_sources_ready(
+    vid_src: &Option<AppSrc>,
+    aud_src: &Option<AppSrc>,
+    name: &str,
+    stream: &str,
+    cancel: &CancellationToken,
+) -> Result<()> {
     let mut start = Instant::now();
     let mut retries = 0;
 
     loop {
+        if cancel.is_cancelled() {
+            return Err(anyhow!("RTSP client cancelled while waiting for sources"));
+        }
+
         let video_ready = vid_src.as_ref().map_or(Ok(true), check_live_ready);
         let audio_ready = aud_src.as_ref().map_or(Ok(true), check_live_ready);
 
         match (video_ready, audio_ready) {
             (Ok(true), Ok(true)) => return Ok(()),
             (Err(e), _) | (_, Err(e)) => {
-                log::error!("OBSERVE: Appsrc readiness failure for {}::{}: {:?}", name, stream, e);
+                log::error!(
+                    "OBSERVE: Appsrc readiness failure for {}::{}: {:?}",
+                    name,
+                    stream,
+                    e
+                );
                 return Err(e);
             }
             _ => {}
@@ -944,10 +1113,17 @@ fn wait_for_sources_ready(vid_src: &Option<AppSrc>, aud_src: &Option<AppSrc>, na
             if retries >= MAX_READY_RETRIES {
                 return Err(anyhow!(
                     "{}::{}: RTSP sources did not become ready after {} retries",
-                    name, stream, retries
+                    name,
+                    stream,
+                    retries
                 ));
             }
-            log::info!("OBSERVE: RTSP client startup retry {} for {}::{}", retries, name, stream);
+            log::info!(
+                "OBSERVE: RTSP client startup retry {} for {}::{}",
+                retries,
+                name,
+                stream
+            );
             start = Instant::now();
         }
 
@@ -1663,7 +1839,12 @@ mod tests {
 
     #[test]
     fn test_prepare_bootstrap_batch_trims_to_latest_keyframe() {
-        let mut batch = vec![sample_pframe(), sample_pframe(), sample_iframe(), sample_pframe()];
+        let mut batch = vec![
+            sample_pframe(),
+            sample_pframe(),
+            sample_iframe(),
+            sample_pframe(),
+        ];
         let needs_keyframe = prepare_bootstrap_batch(&mut batch);
 
         assert!(!needs_keyframe);
