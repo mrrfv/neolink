@@ -16,9 +16,9 @@ members = [
 anyhow = "1.0.70"
 base64 = "0.22.0"
 byte-slice-cast = {version = "1.2.2", optional = true}
-bytes = "1.6.0"
+bytes = "1.11.1"
 clap = { version = "4.2.2", features = ["derive", "cargo"] }
-crossbeam-channel = {version = "0.5.8", optional = true}
+crossbeam-channel = {version = "0.5.15", optional = true}
 dirs = {version = "5.0.1", optional = true}
 env_logger = "0.11.3"
 fcm-push-listener = {version = "2.0.3", optional = true}
