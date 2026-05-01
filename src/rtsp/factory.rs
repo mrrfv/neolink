@@ -67,9 +67,9 @@ const VIDEO_TIMESTAMP_WRAP_WINDOW: u32 = 5_000_000;
 const CLIENT_MEDIA_QUEUE_CAPACITY: usize = 100;
 const MAX_BOOTSTRAP_FRAMES: usize = 256;
 
-/// Maximum number of attempts to reopen a camera stream before propagating the error.
-const REOPEN_MAX_RETRIES: u32 = 10;
 /// Maximum delay between reopen attempts (exponential backoff cap).
+/// There is no retry limit — the factory loops indefinitely until the stream
+/// is restored. The parent NeoCamThread handles fatal connection failures.
 const REOPEN_MAX_DELAY: Duration = Duration::from_secs(30);
 /// If a client sender thread makes no progress for this long, cancel it and let the client reconnect.
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -320,24 +320,22 @@ async fn reopen_stream(
     camera: &NeoInstance,
     stream: StreamKind,
     name: &str,
-) -> AnyResult<tokio::sync::mpsc::Receiver<BcMedia>> {
+) -> tokio::sync::mpsc::Receiver<BcMedia> {
     let mut delay = STREAM_RETRY_DELAY;
-    for attempt in 0..REOPEN_MAX_RETRIES {
+    let mut attempt = 0u64;
+    loop {
+        attempt += 1;
         match camera.stream_while_live(stream).await {
-            Ok(new_media_rx) => return Ok(new_media_rx),
+            Ok(new_media_rx) => return new_media_rx,
             Err(e) => {
                 log::warn!(
-                    "{name}::{stream}: failed to restart camera stream (attempt {}/{REOPEN_MAX_RETRIES}), retrying in {delay:?}: {e:?}",
-                    attempt + 1,
+                    "{name}::{stream}: failed to restart camera stream (attempt {attempt}), retrying in {delay:?}: {e:?}",
                 );
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(REOPEN_MAX_DELAY);
             }
         }
     }
-    Err(anyhow!(
-        "{name}::{stream}: stream restart failed after {REOPEN_MAX_RETRIES} attempts"
-    ))
 }
 
 pub(super) async fn make_factory(
@@ -413,7 +411,7 @@ pub(super) async fn make_factory(
         let mut waiting_for_keyframe = false;
         // Shared flag: set by main loop on stream reconnect, read by sender threads
         // to reset their TimestampState and avoid non-monotonic DTS.
-        let timestamps_reset_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let timestamps_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut client_reap = interval(CLIENT_REAP_INTERVAL);
 
         loop {
@@ -469,10 +467,12 @@ pub(super) async fn make_factory(
                                                 still_open.push(client);
                                             } else if is_keyframe(&media) {
                                                 log::warn!(
-                                                    "OBSERVE: Queue-full drop stream={} media={} (Client Fanout). Dropping keyframe but keeping client.", stream, media_type
+                                                    "OBSERVE: Queue-full I-frame drop stream={} media={} (Client Fanout). Cancelling client to force resync.", stream, media_type
                                                 );
-                                                touch_client_activity(&client.last_activity);
-                                                still_open.push(client);
+                                                client.cancel.cancel();
+                                                if let Some(handle) = client.thread_handle {
+                                                    old_thread_handles.push(handle);
+                                                }
                                             } else {
                                                 log::warn!(
                                                     "OBSERVE: Queue-full drop stream={} media={} (Client Fanout). Backpressure on non-droppable.", stream, media_type
@@ -505,8 +505,8 @@ pub(super) async fn make_factory(
                             log::warn!("{name}::{stream}: Camera stream channel closed, restarting");
                             waiting_for_keyframe = true;
                             buffer.clear();
-                            timestamps_reset_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                            media_rx = reopen_stream(&camera, stream, &name).await?;
+                            timestamps_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+                            media_rx = reopen_stream(&camera, stream, &name).await;
                         }
                         Err(_) => {
                             log::warn!(
@@ -515,8 +515,8 @@ pub(super) async fn make_factory(
                             );
                             waiting_for_keyframe = true;
                             buffer.clear();
-                            timestamps_reset_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                            media_rx = reopen_stream(&camera, stream, &name).await?;
+                            timestamps_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+                            media_rx = reopen_stream(&camera, stream, &name).await;
                         }
                     }
                 },
@@ -608,7 +608,7 @@ pub(super) async fn make_factory(
                         let sender_name = name.clone();
                         let thread_name = format!("{sender_name}::{stream}::sender");
                         let stream_config_clone = stream_config.clone();
-                        let thread_ts_reset = timestamps_reset_flag.clone();
+                        let thread_ts_gen = timestamps_generation.clone();
                         let thread_cancel = client_cancel.clone();
                         let thread_last_activity = client_last_activity.clone();
                         let thread_handle = std::thread::Builder::new()
@@ -618,6 +618,7 @@ pub(super) async fn make_factory(
                                 let mut timestamps = TimestampState::default();
                                 let mut pools = Default::default();
                                 let mut waiting_for_keyframe = bootstrap_needs_keyframe;
+                                let mut local_gen = thread_ts_gen.load(std::sync::atomic::Ordering::Acquire);
 
                                 if let Err(e) = wait_for_sources_ready(
                                     &vid_src,
@@ -669,10 +670,11 @@ pub(super) async fn make_factory(
                                     for data in batch.drain(..) {
                                         touch_client_activity(&thread_last_activity);
                                         // Check if the main loop signaled a stream reconnect
-                                        if thread_ts_reset.load(std::sync::atomic::Ordering::Relaxed) {
-                                            log::info!("{name}::{stream}: Resetting timestamps after stream reconnect");
+                                        let current_gen = thread_ts_gen.load(std::sync::atomic::Ordering::Acquire);
+                                        if current_gen != local_gen {
+                                            log::info!("{name}::{stream}: Resetting timestamps after stream reconnect (gen {local_gen} -> {current_gen})");
                                             timestamps = TimestampState::default();
-                                            thread_ts_reset.store(false, std::sync::atomic::Ordering::Relaxed);
+                                            local_gen = current_gen;
                                         }
 
                                         if waiting_for_keyframe {
@@ -770,7 +772,7 @@ pub(super) async fn make_factory(
 
 fn send_to_sources(
     data: BcMedia,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
+    pools: &mut HashMap<usize, (gstreamer::BufferPool, Instant)>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
     timestamps: &mut TimestampState,
@@ -914,7 +916,7 @@ fn send_to_appsrc(
     duration: Option<Duration>,
     can_drop: bool,
     is_video: bool,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
+    pools: &mut HashMap<usize, (gstreamer::BufferPool, Instant)>,
 ) -> AnyResult<bool> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
@@ -934,23 +936,25 @@ fn send_to_appsrc(
         wait_ms *= 2;
     }
 
-    if retries >= MAX_RETRIES {
-        if can_drop {
-            return Ok(false);
-        }
+    if retries >= MAX_RETRIES && can_drop {
+        return Ok(false);
     }
 
     let msg_size = data.len();
 
     while pools.len() >= MAX_BUFFER_POOLS && !pools.contains_key(&msg_size) {
-        if let Some(&smallest_key) = pools.keys().min() {
-            if let Some(old_pool) = pools.remove(&smallest_key) {
+        if let Some(&oldest_key) = pools
+            .iter()
+            .min_by_key(|(_, (_, last_used))| *last_used)
+            .map(|(k, _)| k)
+        {
+            if let Some((old_pool, _)) = pools.remove(&oldest_key) {
                 let _ = old_pool.set_active(false);
             }
         }
     }
 
-    let pool = pools.entry(msg_size).or_insert_with_key(|size| {
+    let (pool, last_used) = pools.entry(msg_size).or_insert_with_key(|size| {
         let pool = gstreamer::BufferPool::new();
         let mut pool_config = pool.config();
         pool_config.set_params(None, (*size) as u32, 8, 32);
@@ -960,8 +964,9 @@ fn send_to_appsrc(
         if let Err(e) = pool.set_active(true) {
             log::error!("Failed to activate buffer pool: {}", e);
         }
-        pool
+        (pool, Instant::now())
     });
+    *last_used = Instant::now();
 
     let buf = {
         let mut new_buf = pool
@@ -998,23 +1003,6 @@ fn send_to_appsrc(
     }
 }
 
-fn drain_latest_batch(rx: &mut tokio::sync::mpsc::Receiver<BcMedia>) -> Option<Vec<BcMedia>> {
-    let first = rx.blocking_recv()?;
-    let mut batch = vec![first];
-    while let Ok(next) = rx.try_recv() {
-        batch.push(next);
-    }
-
-    if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
-        if last_iframe > 0 {
-            let _ = batch.drain(0..last_iframe);
-        }
-    } else if batch.len() > 1 {
-        log::trace!("Drained RTSP batch without a keyframe; keeping latest media to avoid stalls");
-    }
-
-    Some(batch)
-}
 
 fn drain_latest_batch_with_cancel(
     rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
@@ -1043,7 +1031,7 @@ fn drain_latest_batch_with_cancel(
                 return Some(batch);
             }
             Err(TryRecvError::Empty) => {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(5));
             }
             Err(TryRecvError::Disconnected) => return None,
         }
@@ -1069,6 +1057,10 @@ fn prepare_bootstrap_batch(batch: &mut Vec<BcMedia>) -> bool {
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
+    let (_, current, _) = app.state(gstreamer::ClockTime::ZERO);
+    if current == gstreamer::State::Null {
+        return Err(anyhow!("App source pipeline is in Null state"));
+    }
     app.pads()
         .iter()
         .all(|pad| pad.is_linked())

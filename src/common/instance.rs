@@ -14,7 +14,7 @@ use tokio::{
     time::{sleep, Duration},
 };
 
-const PASSIVE_RETRY_LIMIT: usize = 6;
+const PASSIVE_RETRY_LIMIT: usize = 50;
 use tokio_util::sync::CancellationToken;
 
 use super::{MdState, NeoCamCommand, NeoCamThreadState, Permit};

@@ -506,7 +506,7 @@ fn default_buffer_duration() -> u64 {
 }
 
 fn default_max_discovery_retries() -> usize {
-    10
+    5
 }
 
 fn default_connection_protocol() -> ConnectionProtocol {

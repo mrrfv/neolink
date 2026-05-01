@@ -17,7 +17,7 @@ pub(crate) fn timeout<F>(future: F) -> tokio::time::Timeout<F>
 where
     F: std::future::Future,
 {
-    tokio::time::timeout(tokio::time::Duration::from_secs(15), future)
+    tokio::time::timeout(tokio::time::Duration::from_secs(30), future)
 }
 
 pub(crate) enum AddressOrUid {

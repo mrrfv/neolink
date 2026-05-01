@@ -197,8 +197,16 @@ impl Drop for NeoReactor {
                 let commander = self.commander.clone();
                 let _gt = tokio::runtime::Handle::current().enter();
                 tokio::task::spawn(async move {
-                    let _ = commander.send(NeoReactorCommand::HangUp).await;
-                    while set.join_next().await.is_some() {}
+                    let cleanup = async {
+                        let _ = commander.send(NeoReactorCommand::HangUp).await;
+                        while set.join_next().await.is_some() {}
+                    };
+                    if tokio::time::timeout(std::time::Duration::from_secs(10), cleanup)
+                        .await
+                        .is_err()
+                    {
+                        log::warn!("NeoReactor cleanup timed out after 10s, forcing shutdown");
+                    }
                     log::trace!("Dropped NeoReactor");
                 });
             }

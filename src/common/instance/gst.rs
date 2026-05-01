@@ -16,7 +16,15 @@ use crate::common::PushNoti;
 const MEDIA_CHANNEL_CAPACITY: usize = 100;
 
 impl NeoInstance {
-    /// Streams a camera source while not paused
+    /// Streams a camera source while not paused.
+    ///
+    /// When `pause.on_motion` is enabled in config, this wraps [`Self::stream()`] with
+    /// motion-aware pause/resume logic using a [`UseCounter`]. When disabled, it
+    /// delegates directly to [`Self::stream()`].
+    ///
+    /// **Note**: The two paths have different retry semantics — [`Self::stream()`] uses
+    /// `run_task` (acquires a camera permit, counts against `PASSIVE_RETRY_LIMIT`),
+    /// while this method manages permits externally through a `UseCounter`.
     pub(crate) async fn stream_while_live(
         &self,
         stream: StreamKind,

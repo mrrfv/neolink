@@ -21,7 +21,7 @@ pub(crate) struct UseCounter {
 impl UseCounter {
     pub(crate) async fn new() -> Self {
         let (notifier_tx, mut notifier) = mpsc(100);
-        let (value_tx, value) = watch(0);
+        let (value_tx, value) = watch(0u32);
         let cancel = CancellationToken::new();
         let mut set = JoinSet::new();
 
@@ -38,8 +38,8 @@ impl UseCounter {
                                 log::trace!("Usecounter: {}->{}", *value, (*value) + 1);
                                 *value += 1;
                             } else {
-                                log::trace!("Usecounter: {}->{}", *value, (*value) - 1);
-                                *value -= 1;
+                                log::trace!("Usecounter: {}->{}", *value, (*value).saturating_sub(1u32));
+                                *value = (*value).saturating_sub(1u32);
                             }
                         });
                     }

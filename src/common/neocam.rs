@@ -406,8 +406,16 @@ impl Drop for NeoCam {
         let commander = self.commander.clone();
         let _gt = tokio::runtime::Handle::current().enter();
         tokio::task::spawn(async move {
-            let _ = commander.send(NeoCamCommand::HangUp).await;
-            while set.join_next().await.is_some() {}
+            let cleanup = async {
+                let _ = commander.send(NeoCamCommand::HangUp).await;
+                while set.join_next().await.is_some() {}
+            };
+            if tokio::time::timeout(std::time::Duration::from_secs(10), cleanup)
+                .await
+                .is_err()
+            {
+                log::warn!("NeoCam cleanup timed out after 10s, forcing shutdown");
+            }
             log::trace!("Dropped NeoCam");
         });
     }
