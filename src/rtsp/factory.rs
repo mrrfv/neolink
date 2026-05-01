@@ -49,7 +49,7 @@ const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// If the camera stops producing packets but never hard-closes the channel,
 /// rebuild the stream rather than letting the client sit on stale media.
-const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(3);
 /// Time to wait for a newly created RTSP client pipeline to become live.
 const SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for the RTSP client pipeline to become live.
@@ -204,11 +204,24 @@ struct ClientState {
     last_activity: Arc<Mutex<Instant>>,
 }
 
-#[derive(Default)]
 struct TimestampState {
     next_video_ts: Duration,
     last_video_source_ts: Option<u32>,
     next_audio_ts: Duration,
+    video_needs_discont: bool,
+    audio_needs_discont: bool,
+}
+
+impl Default for TimestampState {
+    fn default() -> Self {
+        Self {
+            next_video_ts: Duration::default(),
+            last_video_source_ts: None,
+            next_audio_ts: Duration::default(),
+            video_needs_discont: true,
+            audio_needs_discont: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -657,6 +670,7 @@ pub(super) async fn make_factory(
                                             Ok(FrameSendOutcome::Sent) => {}
                                             Ok(FrameSendOutcome::DroppedVideo) => {
                                                 waiting_for_keyframe = true;
+                                                timestamps.video_needs_discont = true;
                                             }
                                             Err(r) => {
                                                 log::info!("Failed to send to source: {r:?}");
@@ -697,6 +711,7 @@ pub(super) async fn make_factory(
                                                 Ok(FrameSendOutcome::Sent) => {}
                                                 Ok(FrameSendOutcome::DroppedVideo) => {
                                                     waiting_for_keyframe = true;
+                                                    timestamps.video_needs_discont = true;
                                                 }
                                                 Err(r) => {
                                                     log::info!("Failed to send to source: {r:?}");
@@ -784,7 +799,7 @@ fn send_to_sources(
                 if let Some(aud_src) = aud_src.as_ref() {
                     let pkt_duration = Duration::from_micros(duration as u64);
                     let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
-                    let _ = send_to_appsrc(
+                    let sent = send_to_appsrc(
                         aud_src,
                         aac.data,
                         ts,
@@ -792,7 +807,11 @@ fn send_to_sources(
                         true,
                         false,
                         pools,
+                        timestamps.audio_needs_discont,
                     )?;
+                    if sent {
+                        timestamps.audio_needs_discont = false;
+                    }
                 }
             }
             Ok(FrameSendOutcome::Sent)
@@ -802,7 +821,7 @@ fn send_to_sources(
                 if let Some(aud_src) = aud_src.as_ref() {
                     let pkt_duration = Duration::from_micros(duration as u64);
                     let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
-                    let _ = send_to_appsrc(
+                    let sent = send_to_appsrc(
                         aud_src,
                         adpcm.data,
                         ts,
@@ -810,7 +829,11 @@ fn send_to_sources(
                         true,
                         false,
                         pools,
+                        timestamps.audio_needs_discont,
                     )?;
+                    if sent {
+                        timestamps.audio_needs_discont = false;
+                    }
                 }
             }
             Ok(FrameSendOutcome::Sent)
@@ -827,7 +850,10 @@ fn send_to_sources(
                     &mut timestamps.next_video_ts,
                     pkt_duration,
                 );
-                let _ = send_to_appsrc(vid_src, data, ts, Some(pkt_duration), false, true, pools)?;
+                let sent = send_to_appsrc(vid_src, data, ts, Some(pkt_duration), false, true, pools, timestamps.video_needs_discont)?;
+                if sent {
+                    timestamps.video_needs_discont = false;
+                }
             }
             Ok(FrameSendOutcome::Sent)
         }
@@ -843,7 +869,10 @@ fn send_to_sources(
                     &mut timestamps.next_video_ts,
                     pkt_duration,
                 );
-                if !send_to_appsrc(vid_src, data, ts, Some(pkt_duration), true, true, pools)? {
+                let sent = send_to_appsrc(vid_src, data, ts, Some(pkt_duration), true, true, pools, timestamps.video_needs_discont)?;
+                if sent {
+                    timestamps.video_needs_discont = false;
+                } else {
                     return Ok(FrameSendOutcome::DroppedVideo);
                 }
             }
@@ -917,6 +946,7 @@ fn send_to_appsrc(
     can_drop: bool,
     is_video: bool,
     pools: &mut HashMap<usize, (gstreamer::BufferPool, Instant)>,
+    discont: bool,
 ) -> AnyResult<bool> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
@@ -980,6 +1010,9 @@ fn send_to_appsrc(
         gst_buf_mut.set_pts(time);
         if !is_video {
             gst_buf_mut.set_dts(time);
+        }
+        if discont {
+            gst_buf_mut.set_flags(gstreamer::BufferFlags::DISCONT);
         }
         if let Some(duration) = duration {
             gst_buf_mut.set_duration(gstreamer::ClockTime::from_useconds(
