@@ -1057,10 +1057,6 @@ fn prepare_bootstrap_batch(batch: &mut Vec<BcMedia>) -> bool {
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
-    let (_, current, _) = app.state(gstreamer::ClockTime::ZERO);
-    if current == gstreamer::State::Null {
-        return Err(anyhow!("App source pipeline is in Null state"));
-    }
     app.pads()
         .iter()
         .all(|pad| pad.is_linked())
