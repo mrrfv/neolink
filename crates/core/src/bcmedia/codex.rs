@@ -4,7 +4,7 @@
 //!
 use crate::bcmedia::model::*;
 use crate::{Error, Result};
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use log::*;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -82,11 +82,20 @@ impl Decoder for BcMediaCodex {
                             debug!("Error in stream attempting to restore");
                             trace!("   Stream Error: {:?}", e);
                         }
-                        // Drop the current buffer and wait for a new packet boundary.
-                        // Guessing a magic byte sequence inside a corrupted frame can
-                        // turn packet loss into a permanently malformed elementary stream.
-                        self.amount_skipped += src.len();
-                        src.clear();
+                        // Resync by advancing one byte and letting the parser
+                        // re-validate at the next offset. The frame magics are
+                        // strongly validated (I/P frames require a following
+                        // "H264"/"H265" tag and bounded sizes), so a false match
+                        // inside corrupted data fails the parse and we keep
+                        // scanning. This finds the next real frame boundary
+                        // instead of discarding the whole buffer, which would
+                        // throw away the next valid frame if it had already
+                        // arrived — turning brief packet loss into a multi-second
+                        // gap. When the scan reaches a partial magic at the tail
+                        // (< header size), deserialize reports NomIncomplete and
+                        // those bytes are preserved for the next read.
+                        self.amount_skipped += 1;
+                        src.advance(1);
                         continue;
                     }
                 }

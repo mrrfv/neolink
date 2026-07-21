@@ -20,7 +20,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
+use crate::{
+    common::NeoInstance,
+    rtsp::gst::{default_splash_launch, NeoMediaFactory},
+    AnyResult,
+};
 
 /// Audio buffer size in bytes
 ///
@@ -49,7 +53,16 @@ const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// If the camera stops producing packets but never hard-closes the channel,
 /// rebuild the stream rather than letting the client sit on stale media.
-const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+///
+/// This MUST be longer than the core's own `STREAM_NO_FRAME_TIMEOUT` (15s in
+/// `crates/core/.../stream.rs`). While the core's video subscription is still
+/// alive, a brief WiFi dropout rides through on that same subscription — video
+/// simply resumes when packets return, with no teardown, no keyframe re-wait
+/// and no PTS reset. A shorter value here pre-empts that: it tore down and
+/// rebuilt the whole stream on every multi-second hiccup, which is exactly the
+/// thrashing a flaky Lumus link produces. We only rebuild once the core has
+/// actually given up on the stream.
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Time to wait for a newly created RTSP client pipeline to become live.
 const SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for the RTSP client pipeline to become live.
@@ -66,6 +79,13 @@ const VIDEO_TIMESTAMP_WRAP_WINDOW: u32 = 5_000_000;
 /// At 30fps, 100 frames ≈ 3.3 seconds — enough for jitter, low enough to bound memory.
 const CLIENT_MEDIA_QUEUE_CAPACITY: usize = 100;
 const MAX_BOOTSTRAP_FRAMES: usize = 256;
+
+/// Only catch up to the latest keyframe (dropping older P-frames/GOPs) once a
+/// client's drained backlog reaches this many frames. Below this we keep every
+/// frame to preserve motion for detectors like Frigate. Sized well under the
+/// queue capacity so we react before the queue saturates, but far above normal
+/// scheduling jitter (a few frames) so ordinary operation never decimates.
+const DRAIN_CATCHUP_THRESHOLD: usize = CLIENT_MEDIA_QUEUE_CAPACITY / 4; // ~0.8s at 30fps
 
 /// Maximum delay between reopen attempts (exponential backoff cap).
 /// There is no retry limit — the factory loops indefinitely until the stream
@@ -202,6 +222,10 @@ struct ClientState {
     thread_handle: Option<std::thread::JoinHandle<AnyResult<()>>>,
     cancel: CancellationToken,
     last_activity: Arc<Mutex<Instant>>,
+    /// This client fell behind and had a video frame dropped in fan-out. Until
+    /// the next keyframe is delivered, further video for this client is skipped
+    /// so we never hand its pipeline a dangling P-frame.
+    needs_keyframe: bool,
 }
 
 struct TimestampState {
@@ -221,6 +245,26 @@ impl Default for TimestampState {
             video_needs_discont: true,
             audio_needs_discont: true,
         }
+    }
+}
+
+impl TimestampState {
+    /// Reset source-timestamp tracking on a stream reconnect while KEEPING the
+    /// output clock (`next_video_ts` / `next_audio_ts`) monotonic.
+    ///
+    /// The camera's source timestamps restart after a reconnect, so we must stop
+    /// deriving deltas from the old source value (`last_video_source_ts = None`,
+    /// which makes `next_video_timestamp` fall back to the frame cadence for the
+    /// first post-reconnect frame). But the *output* PTS/DTS we hand to
+    /// GStreamer must never go backwards — zeroing it here made ffmpeg see a
+    /// "non-monotonous DTS", dropping frames and breaking recordings. We mark
+    /// both streams discontinuous so the resume is flagged correctly.
+    fn reset_for_reconnect(&mut self) {
+        self.last_video_source_ts = None;
+        self.video_needs_discont = true;
+        self.audio_needs_discont = true;
+        // next_video_ts and next_audio_ts are intentionally preserved so the
+        // output clock stays monotonic across the reconnect.
     }
 }
 
@@ -318,15 +362,21 @@ fn reap_stale_clients(
     reap_finished_handles(old_thread_handles, stream_name);
 }
 
-fn should_drop_for_backpressure(media: &BcMedia) -> bool {
-    matches!(
-        media,
-        BcMedia::Aac(_) | BcMedia::Adpcm(_) | BcMedia::Pframe(_)
-    )
+// Thin wrappers over the shared `BcMedia` predicates so the whole media path
+// (core transport, instance fan-in, RTSP fan-out) speaks one vocabulary for
+// what may be dropped and where the stream can resync. See `BcMedia::is_video`.
+fn is_keyframe(media: &BcMedia) -> bool {
+    media.is_keyframe()
 }
 
-fn is_keyframe(media: &BcMedia) -> bool {
-    matches!(media, BcMedia::Iframe(_))
+fn media_kind_str(media: &BcMedia) -> &'static str {
+    match media {
+        BcMedia::Iframe(_) => "Iframe",
+        BcMedia::Pframe(_) => "Pframe",
+        BcMedia::Aac(_) => "Aac",
+        BcMedia::Adpcm(_) => "Adpcm",
+        _ => "Other",
+    }
 }
 
 async fn reopen_stream(
@@ -356,7 +406,19 @@ pub(super) async fn make_factory(
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
     let (client_tx, mut client_rx) = mpsc(100);
-    let name = camera.config().await?.borrow().name.clone();
+    let (name, splash_launch) = {
+        let cfg = camera.config().await?;
+        let cfg = cfg.borrow();
+        // When the splash is disabled, use a plain black frame for the
+        // placeholder pipeline so nothing resembling real footage is ever
+        // exposed to an NVR like Frigate.
+        let pattern = if cfg.use_splash {
+            cfg.splash_pattern.to_string()
+        } else {
+            "black".to_string()
+        };
+        (cfg.name.clone(), default_splash_launch(&pattern))
+    };
 
     let thread = tokio::task::spawn(async move {
         let (mut media_rx, mut buffer, mut stream_config) = loop {
@@ -427,12 +489,46 @@ pub(super) async fn make_factory(
         let timestamps_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut client_reap = interval(CLIENT_REAP_INTERVAL);
 
+        // Reopening the upstream camera stream can back off for many seconds.
+        // It MUST NOT be awaited inline in the select! below, or new RTSP
+        // clients (Frigate reconnecting) would not be serviced during that
+        // window and their connect would time out. Instead we run the reopen in
+        // a background task and swap in the fresh receiver when it completes,
+        // while the loop keeps accepting clients.
+        let (reopen_tx, mut reopen_rx) =
+            tokio::sync::mpsc::channel::<tokio::sync::mpsc::Receiver<BcMedia>>(1);
+        let mut reopening = false;
+
+        macro_rules! trigger_reopen {
+            ($reason:expr) => {{
+                if !reopening {
+                    log::warn!("{name}::{stream}: {}, restarting stream", $reason);
+                    reopening = true;
+                    waiting_for_keyframe = true;
+                    buffer.clear();
+                    timestamps_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    let reopen_camera = camera.clone();
+                    let reopen_name = name.clone();
+                    let reopen_tx = reopen_tx.clone();
+                    tokio::spawn(async move {
+                        let new_rx = reopen_stream(&reopen_camera, stream, &reopen_name).await;
+                        let _ = reopen_tx.send(new_rx).await;
+                    });
+                }
+            }};
+        }
+
         loop {
             tokio::select! {
                 _ = client_reap.tick() => {
                     reap_stale_clients(&mut clients, &mut old_thread_handles, &name);
                 }
-                media_opt = tokio::time::timeout(STREAM_STALL_TIMEOUT, media_rx.recv()) => {
+                Some(new_rx) = reopen_rx.recv(), if reopening => {
+                    log::info!("{name}::{stream}: camera stream reopened");
+                    media_rx = new_rx;
+                    reopening = false;
+                }
+                media_opt = tokio::time::timeout(STREAM_STALL_TIMEOUT, media_rx.recv()), if !reopening => {
                     match media_opt {
                         Ok(Some(media)) => {
                             stream_config.update_from_media(&media);
@@ -454,45 +550,45 @@ pub(super) async fn make_factory(
 
                             if !clients.is_empty() {
                                 let mut still_open = Vec::with_capacity(clients.len());
-                                let drop_ok = should_drop_for_backpressure(&media);
-                                let mut delivered = false;
+                                let media_is_keyframe = media.is_keyframe();
+                                let media_is_video = media.is_video();
 
-                                for client in clients.drain(..) {
+                                for mut client in clients.drain(..) {
+                                    // A client that had a video frame dropped is
+                                    // resyncing: skip further video for it until
+                                    // the next keyframe, so its pipeline never
+                                    // receives a dangling P-frame. Audio still
+                                    // flows through.
+                                    if client.needs_keyframe && media_is_video && !media_is_keyframe {
+                                        still_open.push(client);
+                                        continue;
+                                    }
+
                                     match client.sender.try_send(media.clone()) {
                                         Ok(()) => {
+                                            if media_is_keyframe {
+                                                client.needs_keyframe = false;
+                                            }
                                             touch_client_activity(&client.last_activity);
-                                            delivered = true;
                                             still_open.push(client);
                                         }
                                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                            let media_type = match &media {
-                                                BcMedia::Iframe(_) => "Iframe",
-                                                BcMedia::Pframe(_) => "Pframe",
-                                                BcMedia::Aac(_) => "Aac",
-                                                BcMedia::Adpcm(_) => "Adpcm",
-                                                _ => "Other",
-                                            };
-                                            if drop_ok {
-                                                log::debug!(
-                                                "OBSERVE: Queue-full drop stream={} media={} (Client Fanout)", stream, media_type
-                                            );
-                                                touch_client_activity(&client.last_activity);
-                                                still_open.push(client);
-                                            } else if is_keyframe(&media) {
-                                                log::warn!(
-                                                    "OBSERVE: Queue-full I-frame drop stream={} media={} (Client Fanout). Cancelling client to force resync.", stream, media_type
-                                                );
-                                                client.cancel.cancel();
-                                                if let Some(handle) = client.thread_handle {
-                                                    old_thread_handles.push(handle);
-                                                }
-                                            } else {
-                                                log::warn!(
-                                                    "OBSERVE: Queue-full drop stream={} media={} (Client Fanout). Backpressure on non-droppable.", stream, media_type
-                                                );
-                                                touch_client_activity(&client.last_activity);
-                                                still_open.push(client);
+                                            // Consumer is behind. Drop this frame.
+                                            // If it was video, enter resync so we
+                                            // resume cleanly at the next keyframe.
+                                            // Do NOT touch activity on a drop, so a
+                                            // permanently-stuck client is eventually
+                                            // reaped instead of looking alive.
+                                            if media_is_video {
+                                                client.needs_keyframe = true;
                                             }
+                                            log::debug!(
+                                                "OBSERVE: Queue-full drop stream={} media={} (Client Fanout){}",
+                                                stream,
+                                                media_kind_str(&media),
+                                                if media_is_video { ", resyncing at next keyframe" } else { "" }
+                                            );
+                                            still_open.push(client);
                                         }
                                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                             log::info!("Client sender disconnected for {name}::{stream}");
@@ -508,28 +604,15 @@ pub(super) async fn make_factory(
 
                                 // Join any finished old sender threads to reclaim resources
                                 reap_finished_handles(&mut old_thread_handles, &name);
-
-                                if delivered {
-                                    continue;
-                                }
                             }
                         }
                         Ok(None) => {
-                            log::warn!("{name}::{stream}: Camera stream channel closed, restarting");
-                            waiting_for_keyframe = true;
-                            buffer.clear();
-                            timestamps_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
-                            media_rx = reopen_stream(&camera, stream, &name).await;
+                            trigger_reopen!("camera stream channel closed");
                         }
                         Err(_) => {
-                            log::warn!(
-                                "{name}::{stream}: No media received for {:?}, restarting stream",
-                                STREAM_STALL_TIMEOUT
-                            );
-                            waiting_for_keyframe = true;
-                            buffer.clear();
-                            timestamps_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
-                            media_rx = reopen_stream(&camera, stream, &name).await;
+                            trigger_reopen!(format!(
+                                "no media received for {STREAM_STALL_TIMEOUT:?}"
+                            ));
                         }
                     }
                 },
@@ -686,8 +769,8 @@ pub(super) async fn make_factory(
                                         // Check if the main loop signaled a stream reconnect
                                         let current_gen = thread_ts_gen.load(std::sync::atomic::Ordering::Acquire);
                                         if current_gen != local_gen {
-                                            log::info!("{name}::{stream}: Resetting timestamps after stream reconnect (gen {local_gen} -> {current_gen})");
-                                            timestamps = TimestampState::default();
+                                            log::info!("{name}::{stream}: Resetting source-timestamp tracking after stream reconnect (gen {local_gen} -> {current_gen}), keeping output clock monotonic");
+                                            timestamps.reset_for_reconnect();
                                             local_gen = current_gen;
                                         }
 
@@ -735,6 +818,7 @@ pub(super) async fn make_factory(
                             thread_handle,
                             cancel: client_cancel,
                             last_activity: client_last_activity,
+                            needs_keyframe: false,
                         });
                     } else {
                         break;
@@ -759,7 +843,7 @@ pub(super) async fn make_factory(
     });
 
     // Now setup the factory
-    let factory = NeoMediaFactory::new_with_callback(move |element| {
+    let factory = NeoMediaFactory::new_with_callback(&splash_launch, move |element| {
         // Use a SyncSender with a timeout so we don't block the RTSP server
         // indefinitely if the factory background task is busy reopening the camera stream
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -770,7 +854,11 @@ pub(super) async fn make_factory(
             })
             .ok();
 
-        let element = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        // The factory loop now services client requests even while reopening the
+        // upstream stream (reopen runs in the background), so this rarely waits
+        // long. Allow a 2s margin for the loop to be momentarily busy fanning out
+        // a large I-frame so a client connect isn't rejected spuriously.
+        let element = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
             Ok(Ok(e)) => e,
             Ok(Err(e)) => return Err(e),
             Err(e) => {
@@ -1053,12 +1141,25 @@ fn drain_latest_batch_with_cancel(
                     batch.push(next);
                 }
 
-                if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
-                    if last_iframe > 0 {
-                        let _ = batch.drain(0..last_iframe);
+                // Only catch up by jumping to the latest keyframe when the
+                // backlog is genuinely large. The old behaviour trimmed to the
+                // last keyframe on EVERY drain — so a normal 2-3 frame batch
+                // (ordinary scheduling jitter) discarded whole GOPs of P-frames,
+                // destroying the motion Frigate's detector relies on. When only
+                // slightly behind we keep every frame; `send_to_appsrc` still
+                // applies keyframe-aware backpressure downstream if needed.
+                if batch.len() >= DRAIN_CATCHUP_THRESHOLD {
+                    if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
+                        if last_iframe > 0 {
+                            log::debug!(
+                                "RTSP consumer far behind ({} frames queued); catching up to latest keyframe",
+                                batch.len()
+                            );
+                            let _ = batch.drain(0..last_iframe);
+                        }
+                    } else {
+                        log::trace!("Drained large RTSP batch without a keyframe; keeping latest media to avoid stalls");
                     }
-                } else if batch.len() > 1 {
-                    log::trace!("Drained RTSP batch without a keyframe; keeping latest media to avoid stalls");
                 }
 
                 return Some(batch);
@@ -1195,6 +1296,11 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_min_latency(1_000_000_000i64 / (stream_config.fps.max(1) as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
+    // Leaky-downstream is required for a live stream: when the client falls
+    // behind, the appsrc must shed its oldest buffers so latency stays bounded.
+    // Without it, latency grows without bound (I-frames are pushed
+    // unconditionally) and a slightly-slow client drifts minutes behind. The
+    // source-side keyframe-aware logic keeps how often we leak low.
     source.set_leaky_type(AppLeakyType::Downstream);
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
@@ -1255,6 +1361,13 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_min_latency(1_000_000_000i64 / (stream_config.fps.max(1) as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
+    // Leaky-downstream is required for a live stream. When the client falls
+    // behind, the appsrc must shed its oldest buffers so latency stays bounded
+    // (~max-bytes ≈ 2s). Without it the queue grows without bound — I-frames are
+    // pushed unconditionally, so a slightly-slow client drifts minutes behind.
+    // The source-side keyframe-aware logic (per-client resync, drain catch-up)
+    // keeps how often we must leak low, and the decoder recovers at the next
+    // keyframe when a leak does drop mid-GOP.
     source.set_leaky_type(AppLeakyType::Downstream);
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
@@ -1316,6 +1429,13 @@ fn pipe_aac(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> {
     source.set_min_latency(20_000_000);
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
+    // Leaky-downstream is required for a LIVE stream: when the client falls
+    // behind, the appsrc must shed its oldest buffers so latency stays bounded
+    // (~max-bytes ≈ 2s). Without it the queue grows without bound — I-frames are
+    // pushed unconditionally, so a slightly-slow client drifts minutes behind.
+    // The source-side keyframe-aware logic (per-client resync, drain catch-up)
+    // keeps how often we must leak low, and the decoder recovers at the next
+    // keyframe when a leak does drop mid-GOP.
     source.set_leaky_type(AppLeakyType::Downstream);
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
@@ -1382,6 +1502,13 @@ fn pipe_adpcm(bin: &Element, block_size: u32, _stream_config: &StreamConfig) -> 
     source.set_min_latency(20_000_000);
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
+    // Leaky-downstream is required for a LIVE stream: when the client falls
+    // behind, the appsrc must shed its oldest buffers so latency stays bounded
+    // (~max-bytes ≈ 2s). Without it the queue grows without bound — I-frames are
+    // pushed unconditionally, so a slightly-slow client drifts minutes behind.
+    // The source-side keyframe-aware logic (per-client resync, drain catch-up)
+    // keeps how often we must leak low, and the decoder recovers at the next
+    // keyframe when a leak does drop mid-GOP.
     source.set_leaky_type(AppLeakyType::Downstream);
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
@@ -1457,6 +1584,13 @@ fn pipe_silence(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> 
     source.set_min_latency(20_000_000);
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
+    // Leaky-downstream is required for a LIVE stream: when the client falls
+    // behind, the appsrc must shed its oldest buffers so latency stays bounded
+    // (~max-bytes ≈ 2s). Without it the queue grows without bound — I-frames are
+    // pushed unconditionally, so a slightly-slow client drifts minutes behind.
+    // The source-side keyframe-aware logic (per-client resync, drain catch-up)
+    // keeps how often we must leak low, and the decoder recovers at the next
+    // keyframe when a leak does drop mid-GOP.
     source.set_leaky_type(AppLeakyType::Downstream);
     source.set_do_timestamp(false);
     source.set_format(gstreamer::Format::Time);
@@ -1629,6 +1763,9 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
     queue.set_property("max-size-bytes", buffer_size);
     queue.set_property("max-size-buffers", 0u32);
     queue.set_property("max-size-time", 0u64);
+    // Leaky-downstream keeps this decoupling queue bounded for live streaming;
+    // paired with the leaky appsrc it prevents latency from accumulating when a
+    // client can't keep up.
     queue.set_property_from_str("leaky", "downstream");
     Ok(queue)
 }
@@ -1838,22 +1975,51 @@ mod tests {
             tx.try_send(media).unwrap();
         }
 
-        let drained = drain_latest_batch(&mut rx).expect("expected batch");
+        let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new())
+            .expect("expected batch");
         assert_eq!(drained.len(), 3);
         assert!(matches!(drained.first(), Some(BcMedia::Pframe(_))));
         assert!(matches!(drained.last(), Some(BcMedia::Pframe(_))));
     }
 
     #[test]
-    fn test_drain_latest_batch_trims_prekeyframes() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    fn test_drain_small_batch_is_not_decimated() {
+        // A small batch (below the catch-up threshold) must keep every frame,
+        // even when it contains a keyframe — decimating here destroys motion.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         tx.try_send(sample_pframe()).unwrap();
         tx.try_send(sample_pframe()).unwrap();
         tx.try_send(sample_iframe()).unwrap();
         tx.try_send(sample_pframe()).unwrap();
 
-        let drained = drain_latest_batch(&mut rx).expect("expected batch");
-        assert_eq!(drained.len(), 2);
+        let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new())
+            .expect("expected batch");
+        assert_eq!(drained.len(), 4, "small batch should not be trimmed");
+        assert!(matches!(drained.first(), Some(BcMedia::Pframe(_))));
+        assert!(matches!(drained.last(), Some(BcMedia::Pframe(_))));
+    }
+
+    #[test]
+    fn test_drain_large_batch_catches_up_to_keyframe() {
+        // When genuinely far behind (backlog >= DRAIN_CATCHUP_THRESHOLD) we jump
+        // to the latest keyframe to bound latency.
+        assert!(DRAIN_CATCHUP_THRESHOLD >= 2);
+        let total = DRAIN_CATCHUP_THRESHOLD + 4;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(total + 1);
+        // Fill with P-frames, place a keyframe two-from-last.
+        for _ in 0..(total - 2) {
+            tx.try_send(sample_pframe()).unwrap();
+        }
+        tx.try_send(sample_iframe()).unwrap();
+        tx.try_send(sample_pframe()).unwrap();
+
+        let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new())
+            .expect("expected batch");
+        assert_eq!(
+            drained.len(),
+            2,
+            "large batch should be trimmed to the latest keyframe onward"
+        );
         assert!(matches!(drained.first(), Some(BcMedia::Iframe(_))));
         assert!(matches!(drained.last(), Some(BcMedia::Pframe(_))));
     }

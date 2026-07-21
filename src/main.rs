@@ -96,6 +96,10 @@ async fn main() -> Result<()> {
         .validate()
         .with_context(|| format!("Failed to validate the {:?} config file", conf_path))?;
 
+    for camera in config.cameras.iter() {
+        camera.warn_deprecated();
+    }
+
     let neo_reactor = NeoReactor::new(config.clone()).await;
 
     match opt.cmd {

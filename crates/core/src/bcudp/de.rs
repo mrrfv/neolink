@@ -82,7 +82,21 @@ fn udp_disc(buf: &[u8]) -> IResult<&[u8], UdpDiscovery> {
     let (buf, enc_data_slice) = take(payload_size)(buf)?;
 
     let actual_checksum = calc_crc(enc_data_slice);
-    assert_eq!(checksum, actual_checksum);
+    if checksum != actual_checksum {
+        // A corrupt or truncated discovery datagram (e.g. from a relay with a
+        // zeroed UDP checksum on a lossy link) must not panic the reader task.
+        // Return a recoverable parse error so the codec can drop this packet.
+        log::debug!(
+            "DISC: checksum mismatch (expected {:08x}, got {:08x}), dropping packet",
+            checksum,
+            actual_checksum
+        );
+        return Err(Err::Error(make_error(
+            buf,
+            "DISC: checksum mismatch",
+            ErrorKind::Verify,
+        )));
+    }
 
     let decrypted_payload = decrypt(tid, enc_data_slice);
     let payload = UdpXml::try_parse(decrypted_payload.as_slice()).map_err(|e| {

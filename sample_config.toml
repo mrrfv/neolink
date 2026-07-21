@@ -13,8 +13,8 @@ bind = "0.0.0.0"
 # certificate = "/path/to/pem/with/cert/and/key"
 
 # Choose if the client is required to provide a certificate signed by the server's CA.
-# none|requested|required - default none
-# tls_client_auth = "required"
+# none|request|require - default none
+# tls_client_auth = "require"
 
 # You can password protect the rtsp server mount points by adding users
 # like the following me and someone. If you do not add [[users]]
@@ -54,8 +54,11 @@ address = "192.168.1.187:9000"
 # You can uncomment the following to permit only specfic users
 # permitted_users = [ "me" ]
 
-# By default "both" "mainStream" and "subStream" are connected
-# If your device has user connection limits try a single stream instead.
+# Which streams to serve. The default is "all", i.e. mainStream + subStream +
+# externStream connected concurrently. On battery / Wi-Fi cameras (e.g. Lumus)
+# three concurrent streams strain the link and drain the battery — prefer a
+# single stream, or "both" (main + sub), there.
+#   values: "all" | "both" | "mainStream" | "subStream" | "externStream" | "none"
 # stream = "mainStream"
 
 # Baichuan transport used for the camera connection.

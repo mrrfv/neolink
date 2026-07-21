@@ -26,6 +26,16 @@ glib::wrapper! {
     pub(crate) struct NeoMediaFactory(ObjectSubclass<NeoMediaFactoryImpl>) @extends RTSPMediaFactory;
 }
 
+/// Build the placeholder RTSP launch pipeline shown before a real client
+/// pipeline is substituted. `pattern` is a `videotestsrc` pattern name (see
+/// `SplashPattern`). Callers pick `"black"` when the user disables the splash so
+/// nothing resembling real footage is ever exposed to an NVR.
+pub(crate) fn default_splash_launch(pattern: &str) -> String {
+    format!(
+        "videotestsrc pattern=\"{pattern}\" ! video/x-raw,width=896,height=512,framerate=25/1 ! identity name=\"inittextoverlay\" ! jpegenc ! rtpjpegpay name=pay0"
+    )
+}
+
 impl Default for NeoMediaFactory {
     fn default() -> Self {
         Self::new()
@@ -34,6 +44,10 @@ impl Default for NeoMediaFactory {
 
 impl NeoMediaFactory {
     fn new() -> Self {
+        Self::new_with_launch(&default_splash_launch("snow"))
+    }
+
+    fn new_with_launch(launch: &str) -> Self {
         let factory = Object::new::<NeoMediaFactory>();
         // Each RTSP client gets its own GStreamer bin and appsrc pair. The
         // upstream camera stream is shared in Rust land, where we can fan out
@@ -42,16 +56,16 @@ impl NeoMediaFactory {
         factory.set_eos_shutdown(false);
         factory.set_stop_on_disconnect(false);
         factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::Reset);
-        factory.set_launch("videotestsrc pattern=\"snow\" ! video/x-raw,width=896,height=512,framerate=25/1 ! identity name=\"inittextoverlay\" ! jpegenc ! rtpjpegpay name=pay0");
+        factory.set_launch(launch);
         factory.set_transport_mode(RTSPTransportMode::PLAY);
         factory
     }
 
-    pub(crate) async fn new_with_callback<F>(callback: F) -> AnyResult<Self>
+    pub(crate) async fn new_with_callback<F>(launch: &str, callback: F) -> AnyResult<Self>
     where
         F: Fn(Element) -> AnyResult<Option<Element>> + Send + Sync + 'static,
     {
-        let factory = Self::new();
+        let factory = Self::new_with_launch(launch);
         factory.imp().set_callback(callback).await;
         Ok(factory)
     }

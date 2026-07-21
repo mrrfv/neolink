@@ -15,6 +15,16 @@ use crate::common::PushNoti;
 /// while preventing excessive memory usage (~10 MB per stream at 8 Mbps)
 const MEDIA_CHANNEL_CAPACITY: usize = 100;
 
+fn media_kind_str(media: &BcMedia) -> &'static str {
+    match media {
+        BcMedia::Iframe(_) => "Iframe",
+        BcMedia::Pframe(_) => "Pframe",
+        BcMedia::Aac(_) => "Aac",
+        BcMedia::Adpcm(_) => "Adpcm",
+        _ => "Other",
+    }
+}
+
 impl NeoInstance {
     /// Streams a camera source while not paused.
     ///
@@ -170,24 +180,36 @@ impl NeoInstance {
                         },
                         v = async {
                             log::debug!("Getting stream");
-                            let mut stream = thread_camera.stream(stream).await?;
+                            let mut media_stream = thread_camera.stream(stream).await?;
                             log::debug!("Got stream");
-                            while let Some(media) = stream.recv().await {
-                                if let Err(err) = media_tx.try_send(media) {
-                                    match err {
-                                        TrySendError::Full(m) => {
-                                            let media_type = match &m {
-                                                BcMedia::Iframe(_) => "Iframe",
-                                                BcMedia::Pframe(_) => "Pframe",
-                                                BcMedia::Aac(_) => "Aac",
-                                                BcMedia::Adpcm(_) => "Adpcm",
-                                                _ => "Other",
-                                            };
-                                            log::warn!("OBSERVE: Queue-full drop stream={:?} media={}", stream, media_type);
+                            // If we drop a video frame here (shared fan-in for
+                            // every RTSP client), resync at the next keyframe so
+                            // we never forward a dangling P-frame downstream.
+                            let mut waiting_for_keyframe = false;
+                            while let Some(media) = media_stream.recv().await {
+                                if waiting_for_keyframe && media.is_video() && !media.is_keyframe() {
+                                    continue;
+                                }
+                                let is_keyframe = media.is_keyframe();
+                                match media_tx.try_send(media) {
+                                    Ok(()) => {
+                                        if is_keyframe {
+                                            waiting_for_keyframe = false;
                                         }
-                                        TrySendError::Closed(_) => {
-                                            return AnyResult::Ok(());
+                                    }
+                                    Err(TrySendError::Full(m)) => {
+                                        if m.is_video() {
+                                            waiting_for_keyframe = true;
                                         }
+                                        log::warn!(
+                                            "OBSERVE: Queue-full drop stream={:?} media={}{}",
+                                            stream,
+                                            media_kind_str(&m),
+                                            if m.is_video() { ", resyncing at next keyframe" } else { "" }
+                                        );
+                                    }
+                                    Err(TrySendError::Closed(_)) => {
+                                        return AnyResult::Ok(());
                                     }
                                 }
                             }
@@ -254,29 +276,39 @@ impl NeoInstance {
                     Box::pin(async move {
                         let mut media_stream = cam.start_video(stream, 0, strict).await?;
                         log::trace!("Camera started");
+                        // If we drop a video frame here, resync at the next
+                        // keyframe so we never forward a dangling P-frame.
+                        let mut waiting_for_keyframe = false;
                         loop {
                             match media_stream.get_data().await {
-                                Ok(Ok(media)) => match media_tx.try_send(media) {
-                                    Ok(()) => {}
-                                    Err(TrySendError::Full(m)) => {
-                                        let media_type = match &m {
-                                            BcMedia::Iframe(_) => "Iframe",
-                                            BcMedia::Pframe(_) => "Pframe",
-                                            BcMedia::Aac(_) => "Aac",
-                                            BcMedia::Adpcm(_) => "Adpcm",
-                                            _ => "Other",
-                                        };
-                                        log::warn!(
-                                            "OBSERVE: Queue-full drop stream={:?} media={}",
-                                            stream,
-                                            media_type
-                                        );
+                                Ok(Ok(media)) => {
+                                    if waiting_for_keyframe && media.is_video() && !media.is_keyframe() {
+                                        continue;
                                     }
-                                    Err(TrySendError::Closed(_)) => {
-                                        log::trace!("Stream consumer dropped");
-                                        return AnyResult::Ok(());
+                                    let is_keyframe = media.is_keyframe();
+                                    match media_tx.try_send(media) {
+                                        Ok(()) => {
+                                            if is_keyframe {
+                                                waiting_for_keyframe = false;
+                                            }
+                                        }
+                                        Err(TrySendError::Full(m)) => {
+                                            if m.is_video() {
+                                                waiting_for_keyframe = true;
+                                            }
+                                            log::warn!(
+                                                "OBSERVE: Queue-full drop stream={:?} media={}{}",
+                                                stream,
+                                                media_kind_str(&m),
+                                                if m.is_video() { ", resyncing at next keyframe" } else { "" }
+                                            );
+                                        }
+                                        Err(TrySendError::Closed(_)) => {
+                                            log::trace!("Stream consumer dropped");
+                                            return AnyResult::Ok(());
+                                        }
                                     }
-                                },
+                                }
                                 Ok(Err(e)) => {
                                     log::debug!("Recovered from stream error: {:?}", e);
                                 }

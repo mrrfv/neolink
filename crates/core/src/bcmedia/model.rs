@@ -16,6 +16,30 @@ pub enum BcMedia {
     /// Internal variant to skip markers/NULLs
     Skip,
 }
+impl BcMedia {
+    /// True if this is a video keyframe (I-frame) — an independently decodable
+    /// resync point. After any video frame is dropped, the stream must be
+    /// resumed at one of these.
+    pub fn is_keyframe(&self) -> bool {
+        matches!(self, BcMedia::Iframe(_))
+    }
+
+    /// True if this frame carries video (I- or P-frame).
+    ///
+    /// Dropping video breaks the decode reference chain, so any layer that drops
+    /// a video frame must then drop further video until the next keyframe
+    /// (`is_keyframe`) before forwarding again — otherwise it delivers dangling
+    /// P-frames that reference data the consumer never received.
+    pub fn is_video(&self) -> bool {
+        matches!(self, BcMedia::Iframe(_) | BcMedia::Pframe(_))
+    }
+
+    /// True if this frame carries audio. Audio has no inter-frame references, so
+    /// it can be dropped under backpressure without forcing a video resync.
+    pub fn is_audio(&self) -> bool {
+        matches!(self, BcMedia::Aac(_) | BcMedia::Adpcm(_))
+    }
+}
 //
 pub(super) const MAGIC_HEADER_BCMEDIA_INFO_V1: u32 = 0x31303031;
 pub(super) const MAGIC_HEADER_BCMEDIA_NULL: u32 = 0x00000000;

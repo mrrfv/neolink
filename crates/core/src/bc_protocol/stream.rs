@@ -395,20 +395,11 @@ impl BcCamera {
             StreamKind::Extern => 0,
         };
 
-        // Theses are the numbers used with the official client
-        // On an E1 and swann cameras:
-        //  - mainStream always has a value of 0
-        //  - subStream always has a value of 1
-        //  - There is no externStram
-        // On a B800:
-        //  - mainStream is 0
-        //  - subStream is 256
-        //  - externStram is 1024
-        let handle = match stream {
-            StreamKind::Main => 0,
-            StreamKind::Sub => 256,
-            StreamKind::Extern => 1024,
-        };
+        // Use the same per-session handle derivation as `start_video`. The old
+        // fixed values (0/256/1024) can leave the camera believing the previous
+        // session is still active and cause it to reject a subsequent restart
+        // with an HTTP-style 400. See `stream_handle`.
+        let handle = stream_handle(msg_num, stream);
 
         let stop_video = Bc::new_from_xml(
             BcMeta {

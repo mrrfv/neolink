@@ -128,6 +128,7 @@ impl StreamConfig {
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
 #[validate(schema(function = "validate_camera_config"))]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CameraConfig {
     pub(crate) name: String,
 
@@ -221,6 +222,28 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_connection_protocol", alias = "protocol")]
     pub(crate) protocol: ConnectionProtocol,
+
+    /// Deprecated and ignored. The video format (H264/H265) is auto-detected
+    /// from the stream now. Older configs and the E1/Lumus docs instructed
+    /// setting `format = "h264"`; it is still accepted (so those configs load
+    /// with `deny_unknown_fields`) but has no effect. A warning is logged if
+    /// present — see [`CameraConfig::warn_deprecated`].
+    #[serde(default, alias = "video_format", skip_serializing_if = "Option::is_none")]
+    pub(crate) format: Option<String>,
+}
+
+impl CameraConfig {
+    /// Emit warnings for deprecated/ignored options so a user who set them (e.g.
+    /// following the old Lumus docs) understands why they have no effect,
+    /// instead of the value being silently swallowed.
+    pub(crate) fn warn_deprecated(&self) {
+        if self.format.is_some() {
+            log::warn!(
+                "{}: `format` is deprecated and ignored — the video codec is auto-detected from the stream. You can remove it from your config.",
+                self.name
+            );
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
@@ -538,5 +561,47 @@ fn validate_camera_config(camera_config: &CameraConfig) -> Result<(), Validation
             "Either camera address or uid must be given",
         )),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_camera(body: &str) -> Result<Config, toml::de::Error> {
+        let toml = format!(
+            "[[cameras]]\nname = \"cam\"\nusername = \"admin\"\naddress = \"192.168.1.10:9000\"\n{body}"
+        );
+        toml::from_str::<Config>(&toml)
+    }
+
+    #[test]
+    fn sample_config_parses() {
+        // The shipped sample must always parse (guards deny_unknown_fields
+        // against accidentally rejecting a documented key).
+        let sample = include_str!("../sample_config.toml");
+        toml::from_str::<Config>(sample).expect("sample_config.toml must parse");
+    }
+
+    #[test]
+    fn deprecated_format_key_is_accepted() {
+        // Older configs / the E1+Lumus docs set `format = "h264"`. It must still
+        // load (deny_unknown_fields would otherwise reject it) even though it is
+        // ignored.
+        let config = parse_camera("format = \"h264\"").expect("format key should be accepted");
+        assert_eq!(config.cameras[0].format.as_deref(), Some("h264"));
+    }
+
+    #[test]
+    fn unknown_key_is_rejected() {
+        // A typo'd/unknown key (here a misspelling of `buffer_duration`) must now
+        // fail loudly instead of being silently ignored.
+        let err = parse_camera("bufffer_duration = 5000")
+            .expect_err("unknown key should be rejected");
+        assert!(
+            err.to_string().contains("bufffer_duration")
+                || err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
+        );
     }
 }

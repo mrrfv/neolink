@@ -305,6 +305,10 @@ struct UdpPayloadInner {
     packets_want: u32,
     sent: BTreeMap<u32, UdpData>,
     recieved: BTreeMap<u32, Vec<u8>>,
+    /// When the head-of-line packet (`packets_want`) first went missing while
+    /// later packets kept arriving. Used to bound how long we wait for the
+    /// camera to resend a lost packet before declaring the gap unrecoverable.
+    reorder_gap_since: Option<Instant>,
     /// Offical Client does ack every 10ms if we don't also do this the camera
     /// seems to think we have a poor connection and will abort
     /// This `ack_interval` controls how ofen we do this
@@ -480,6 +484,7 @@ impl UdpPayloadInner {
             packets_want: 0,
             sent: Default::default(),
             recieved: Default::default(),
+            reorder_gap_since: None,
             resend_interval: interval(Duration::from_millis(500)), // Offical Client does resend every 500ms
             ack_latency: Default::default(),
             cancel,
@@ -560,24 +565,39 @@ impl UdpPayloadInner {
         }?;
         log::trace!("Send");
 
-        // Prevent OOM by bounding the reorder buffer.
-        // If we have buffered too many out-of-order packets waiting for a missing one,
-        // we force-advance the stream to the oldest available packet, dropping the missing ones.
-        const MAX_REORDER_BUFFER: usize = 1024; // ~1.3MB at 1350 bytes per packet
-        if self.recieved.len() > MAX_REORDER_BUFFER {
-            if let Some(&first_buffered) = self.recieved.keys().next() {
-                log::error!(
-                    "UDP reorder buffer exceeded limit ({}). Missing packets {} to {}. Force-advancing stream.",
-                    MAX_REORDER_BUFFER, self.packets_want, first_buffered.saturating_sub(1)
-                );
-                self.packets_want = first_buffered;
-            }
-        }
-
+        // Deliver every contiguous packet we have to the consumer.
         while let Some(payload) = self.recieved.remove(&self.packets_want) {
             log::trace!("  + {}", self.packets_want);
             self.packets_want += 1;
             self.thread_stream.feed(Ok(payload)).await?;
+        }
+
+        // If packets remain buffered after draining, we are blocked on a
+        // missing head-of-line packet (`packets_want`) while later packets keep
+        // arriving. The camera resends unacked packets every 500ms, so a
+        // short-lived hole recovers on its own. If it does NOT recover, the old
+        // behaviour force-advanced `packets_want` past the gap — splicing
+        // non-contiguous bytes together, which desyncs the length-prefixed BC
+        // framer and corrupts the elementary stream in a way that is hard to
+        // recover from. Instead, bound the wait by both buffered size (to cap
+        // memory) and elapsed time, then surface a recoverable error. That
+        // tears the UDP session down cleanly so the connection reconnects and
+        // video resumes on a fresh keyframe rather than on garbage.
+        const MAX_REORDER_BUFFER: usize = 1024; // ~1.3MB at 1350 bytes per packet
+        const MAX_REORDER_GAP: Duration = Duration::from_secs(5);
+        if self.recieved.is_empty() {
+            self.reorder_gap_since = None;
+        } else {
+            let gap_since = *self.reorder_gap_since.get_or_insert_with(Instant::now);
+            let buffered = self.recieved.len();
+            let waited = gap_since.elapsed();
+            if buffered > MAX_REORDER_BUFFER || waited > MAX_REORDER_GAP {
+                log::warn!(
+                    "UDP reorder gap unrecoverable: missing packet {} with {} later packets buffered ({:?} waited). Reconnecting to resync.",
+                    self.packets_want, buffered, waited
+                );
+                return Err(Error::BcUdpTimeout);
+            }
         }
         log::trace!("recieved: {}", self.recieved.len());
         log::trace!("Flush");

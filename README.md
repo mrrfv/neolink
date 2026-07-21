@@ -13,6 +13,7 @@ Changes:
 - RTSP paths are exposed immediately at startup, with unique per-session stream handles
 - RTSP timing is monotonic, keyframe-aware, and drops stale backlog under backpressure for lower latency
 - Camera transport is configurable with `protocol = "Udp" | "Tcp" | "TcpUdp"` and defaults to UDP
+- Invalid config options strictly return an error
 
 ---
 
@@ -651,8 +652,11 @@ If you experience frequent disconnections or stream interruptions:
 
 Neolink uses internal buffers to handle network jitter and client delays:
 
-- **Video buffers**: ~2 seconds of video per stream
-- **Message channels**: ~16 seconds of frames at 30fps
+- **Per-stream media channel**: 100 frames (~3.3 s at 30 fps) between the
+  camera transport and each RTSP client
+- **Per-client fan-out queue**: 100 frames; the sender resyncs on the next
+  keyframe if it falls far behind, so motion is preserved rather than decimated
+- **Video appsrc / queue**: ~2 s of video, sized from the stream bitrate
 - **RTSP sessions**: 120 second idle timeout
 
 These values are tuned for reliability. If you need lower latency, consider

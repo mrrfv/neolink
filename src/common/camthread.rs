@@ -222,16 +222,24 @@ impl NeoCamThread {
             config.pause.motion_timeout
         );
 
+        // Give the camera firmware a moment to finish initializing before the
+        // first query — some models error if queried immediately after login.
+        // This is the only unconditional wakeup delay; the previous second
+        // 2s sleep was paid on every reconnect (even with update_time=false),
+        // needlessly lengthening every Frigate stream gap.
         sleep(CAMERA_WAKEUP_DELAY).await;
+
+        // Publish the camera handle now so streaming (and any waiting RTSP
+        // clients) can resume immediately. Time-setting shares the same
+        // connection and does not need to gate video — it runs concurrently.
+        self.camera_watch.send_replace(Arc::downgrade(&camera));
+
         if let Err(e) = update_camera_time(&camera, &name, config.update_time).await {
             log::warn!(
                 "{}: Could not set camera time (perhaps your login is not an admin): {e:?}",
                 name
             );
         }
-        sleep(CAMERA_WAKEUP_DELAY).await;
-
-        self.camera_watch.send_replace(Arc::downgrade(&camera));
 
         let cancel_check = self.cancel.clone();
         let mut health_tick = interval(Duration::from_secs(60));
@@ -472,10 +480,34 @@ impl NeoCamThread {
 
             match result {
                 Ok(()) => {
-                    // Normal shutdown
-                    log::trace!("Normal camera shutdown");
-                    self.cancel.cancel();
-                    return Ok(());
+                    // `run_camera` returns Ok both when the cancel token fires (a
+                    // genuine teardown: camera removed from config, or process
+                    // shutdown via HangUp) and when `camera.join()` completes
+                    // cleanly (the camera closed its own connection). Only the
+                    // former should terminate this thread. The latter is the
+                    // normal battery/WiFi case — a Lumus dropping to sleep — and
+                    // must reconnect, otherwise the camera stays dead for the
+                    // life of the process (the reactor never revives it).
+                    if self.cancel.is_cancelled() {
+                        log::trace!("Normal camera shutdown");
+                        return Ok(());
+                    }
+
+                    log::info!(
+                        "{name}: Camera connection ended cleanly after {:?}; reconnecting",
+                        session_uptime
+                    );
+                    let kind = ReconnectFailureKind::Noisy;
+                    backoff = next_backoff_delay(backoff, kind, session_uptime);
+                    log::info!(
+                        "METRIC camera={} event=reconnect failure_kind={:?} session_uptime_ms={} backoff_ms={}",
+                        name,
+                        kind,
+                        session_uptime.as_millis(),
+                        backoff.as_millis()
+                    );
+                    log::info!("{name}: Attempt reconnect in {:?}", backoff);
+                    sleep(backoff).await;
                 }
                 Err(e) => {
                     // An error

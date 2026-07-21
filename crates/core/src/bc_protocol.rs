@@ -274,8 +274,13 @@ impl BcCamera {
                     if allow_remote {
                         let uid_remote = uid.clone();
                         info!("{}: Trying remote discovery", options.name);
+                        // The device-initiated path inside `remote` waits up to
+                        // MAXIMUM_WAIT (15s) for the camera to respond. A sleepy
+                        // battery/WiFi camera routinely takes longer than 5s to be
+                        // woken by the registrar, so a 5s cap cut this path off at
+                        // 1/3 of its designed budget.
                         match tokio::time::timeout(
-                            tokio::time::Duration::from_secs(5),
+                            tokio::time::Duration::from_secs(15),
                             discovery.remote(&uid_remote, &reg_result),
                         )
                         .await
@@ -301,8 +306,10 @@ impl BcCamera {
                     if allow_map {
                         let uid_map = uid.clone();
                         info!("{}: Trying map discovery", options.name);
+                        // Same 15s budget as remote: the device-initiated map path
+                        // also waits up to MAXIMUM_WAIT for the camera to respond.
                         match tokio::time::timeout(
-                            tokio::time::Duration::from_secs(5),
+                            tokio::time::Duration::from_secs(15),
                             discovery.map(&reg_result),
                         )
                         .await
@@ -326,10 +333,37 @@ impl BcCamera {
                     }
 
                     if allow_relay {
-                        debug!(
-                            "{}: Skipping relay discovery fallback; waiting for a direct path is more reliable for long-lived RTSP streaming",
-                            options.name
-                        );
+                        // Relay is the last resort: it forwards video through
+                        // Reolink's servers, which is less ideal for long-lived
+                        // streams than a direct path, but for a camera behind
+                        // CGNAT/double-NAT where hole punching fails it is the
+                        // ONLY working path. Attempting the direct methods first
+                        // (above) already gives them priority; falling through to
+                        // relay is strictly better than returning no route at all.
+                        let uid_relay = uid.clone();
+                        info!("{}: Trying relay discovery", options.name);
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(15),
+                            discovery.relay(&reg_result),
+                        )
+                        .await
+                        {
+                            Ok(Ok(disc)) => {
+                                info!(
+                                    "{}: Relay success {} at {}",
+                                    options.name,
+                                    uid_relay,
+                                    disc.get_addr()
+                                );
+                                return Ok(CameraLocation::Udp(disc));
+                            }
+                            Ok(Err(e)) => {
+                                debug!("{}: Relay discovery failed: {:?}", options.name, e);
+                            }
+                            Err(_) => {
+                                debug!("{}: Relay discovery timed out", options.name);
+                            }
+                        }
                     }
 
                     Err(Error::DiscoveryTimeout)

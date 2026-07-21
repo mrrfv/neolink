@@ -125,8 +125,10 @@ these things is beyond the scope of this tutorial.
 
 - Note for E1 and Lumus
 
-  If your camera is an E1 or a Lumus you will need to add the `format` line
-  to your `[[ cameras ]]` block like this:
+  The video codec (H264/H265) is now auto-detected from the stream, so the
+  `format` line that older guides told E1/Lumus owners to add is no longer
+  needed. It is still accepted for backward compatibility but is ignored (a
+  warning is logged), so you can safely remove it:
 
   ```toml
   [[cameras]]
@@ -134,11 +136,7 @@ these things is beyond the scope of this tutorial.
   username = "admin"
   password = "12345678"
   address = "192.168.1.187:9000"
-  format = "h264"
   ```
-
-  This will tell neolink that this camera uses the H264 format for its video.
-  Future version of neolink will auto detect this.
 
 Set up as many `[[ cameras ]]` as you want and save the file as `my_config.toml`
 
@@ -270,14 +268,11 @@ If the mainStream fails but the subStream succeeds you may need to add
     h265parse gsth265parse.c:1110:gst_h265_parse_handle_frame:<h265parse0> broken/invalid nal Type: 48 Invalid, Size: 1073 will be dropped
     ```
 
-    You have not set the format to `h264` in the `[[ cameras ]]` config while
-    using an E1 or Lumus camera.
-
-    Change the `[[ cameras ]]` config to include `format = "h264"` and restart
-    neolink
-
-    (If you are using another camera and you need to use h264 please let us
-      know via an issue so we can update this guide)
+    The codec is auto-detected from the stream, so this should no longer occur
+    from a misconfigured `format`. If you still see it, the stream may be
+    momentarily corrupted (e.g. a lossy Wi-Fi link) — neolink resynchronises on
+    the next keyframe automatically. If it persists, please open an issue with
+    your camera model and logs so we can investigate.
 
 - Something else
 

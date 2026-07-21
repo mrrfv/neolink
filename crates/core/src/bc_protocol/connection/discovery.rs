@@ -1383,8 +1383,13 @@ fn get_broadcasts(ports: &[u16]) -> Result<Vec<SocketAddr>> {
 }
 
 fn generate_tid() -> u32 {
+    // Local discovery fans out 6-10 concurrent transactions, each needing a
+    // distinct transaction id. A u8 gives only 256 values (birthday-bound
+    // collision ~15-20% per attempt) and includes 0, which `retry_send` treats
+    // as "unset" and which routes to the promiscuous "listen to all" handler.
+    // Use the full non-zero u32 range so collisions are negligible.
     let mut rng = thread_rng();
-    (rng.gen::<u8>()) as u32
+    rng.gen_range(1..=u32::MAX)
 }
 
 fn generate_cid() -> i32 {

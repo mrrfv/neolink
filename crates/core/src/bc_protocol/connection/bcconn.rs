@@ -382,15 +382,6 @@ impl Poller {
                                         let max_capacity = sender.max_capacity();
                                         let threshold = max_capacity / 10; // 10% remaining
 
-                                        if capacity == 0 {
-                                            warn!(
-                                                "OBSERVE: Subscriber saturated for msg {} (ID: {}), dropping subscriber to preserve stream integrity",
-                                                msg_num, msg_id
-                                            );
-                                            occ.remove(&Some(msg_num));
-                                            continue;
-                                        }
-
                                         if capacity <= threshold {
                                             debug!(
                                                 "Channel low: {}/{} for msg {} (ID: {})",
@@ -411,11 +402,19 @@ impl Poller {
                                             Err(tokio::sync::mpsc::error::TrySendError::Full(
                                                 _,
                                             )) => {
-                                                warn!(
-                                                    "OBSERVE: Subscriber full for msg {} (ID: {}), dropping subscriber to avoid backpressure",
+                                                // Consumer is momentarily behind. Drop THIS frame
+                                                // but keep the subscriber. Removing it here would
+                                                // permanently unsubscribe (for video: the camera
+                                                // keeps sending into the void until the stream
+                                                // stall timeout tears everything down — the classic
+                                                // flaky-WiFi teardown). A dropped frame is
+                                                // recoverable: video resynchronises on the next
+                                                // keyframe, and control replies are retried by the
+                                                // caller's own timeout/retry logic.
+                                                debug!(
+                                                    "OBSERVE: Subscriber full for msg {} (ID: {}), dropping frame (keeping subscriber)",
                                                     msg_num, msg_id
                                                 );
-                                                occ.remove(&Some(msg_num));
                                             }
                                             Err(
                                                 tokio::sync::mpsc::error::TrySendError::Closed(_),
