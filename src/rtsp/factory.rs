@@ -488,6 +488,8 @@ pub(super) async fn make_factory(
         // to reset their TimestampState and avoid non-monotonic DTS.
         let timestamps_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut client_reap = interval(CLIENT_REAP_INTERVAL);
+        client_reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_media_received = Instant::now();
 
         // Reopening the upstream camera stream can back off for many seconds.
         // It MUST NOT be awaited inline in the select! below, or new RTSP
@@ -522,15 +524,22 @@ pub(super) async fn make_factory(
             tokio::select! {
                 _ = client_reap.tick() => {
                     reap_stale_clients(&mut clients, &mut old_thread_handles, &name);
+                    if !reopening && last_media_received.elapsed() >= STREAM_STALL_TIMEOUT {
+                        trigger_reopen!(format!(
+                            "no media received for {STREAM_STALL_TIMEOUT:?}"
+                        ));
+                    }
                 }
                 Some(new_rx) = reopen_rx.recv(), if reopening => {
                     log::info!("{name}::{stream}: camera stream reopened");
                     media_rx = new_rx;
+                    last_media_received = Instant::now();
                     reopening = false;
                 }
-                media_opt = tokio::time::timeout(STREAM_STALL_TIMEOUT, media_rx.recv()), if !reopening => {
+                media_opt = media_rx.recv(), if !reopening => {
                     match media_opt {
-                        Ok(Some(media)) => {
+                        Some(media) => {
+                            last_media_received = Instant::now();
                             stream_config.update_from_media(&media);
                             if waiting_for_keyframe {
                                 if !is_keyframe(&media) {
@@ -606,13 +615,8 @@ pub(super) async fn make_factory(
                                 reap_finished_handles(&mut old_thread_handles, &name);
                             }
                         }
-                        Ok(None) => {
+                        None => {
                             trigger_reopen!("camera stream channel closed");
-                        }
-                        Err(_) => {
-                            trigger_reopen!(format!(
-                                "no media received for {STREAM_STALL_TIMEOUT:?}"
-                            ));
                         }
                     }
                 },
@@ -938,7 +942,16 @@ fn send_to_sources(
                     &mut timestamps.next_video_ts,
                     pkt_duration,
                 );
-                let sent = send_to_appsrc(vid_src, data, ts, Some(pkt_duration), false, true, pools, timestamps.video_needs_discont)?;
+                let sent = send_to_appsrc(
+                    vid_src,
+                    data,
+                    ts,
+                    Some(pkt_duration),
+                    false,
+                    true,
+                    pools,
+                    timestamps.video_needs_discont,
+                )?;
                 if sent {
                     timestamps.video_needs_discont = false;
                 }
@@ -957,7 +970,16 @@ fn send_to_sources(
                     &mut timestamps.next_video_ts,
                     pkt_duration,
                 );
-                let sent = send_to_appsrc(vid_src, data, ts, Some(pkt_duration), true, true, pools, timestamps.video_needs_discont)?;
+                let sent = send_to_appsrc(
+                    vid_src,
+                    data,
+                    ts,
+                    Some(pkt_duration),
+                    true,
+                    true,
+                    pools,
+                    timestamps.video_needs_discont,
+                )?;
                 if sent {
                     timestamps.video_needs_discont = false;
                 } else {
@@ -1123,7 +1145,6 @@ fn send_to_appsrc(
         Err(e) => Err(anyhow::anyhow!("Error in streaming: {e:?}")),
     }
 }
-
 
 fn drain_latest_batch_with_cancel(
     rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
@@ -2047,5 +2068,12 @@ mod tests {
         assert!(needs_keyframe);
         assert_eq!(batch.len(), 1);
         assert!(matches!(batch.first(), Some(BcMedia::Pframe(_))));
+    }
+
+    #[test]
+    fn test_stall_timeout_relationship() {
+        // CLIENT_REAP_INTERVAL must be strictly less than STREAM_STALL_TIMEOUT
+        // so client reap ticks can regularly check stall conditions.
+        assert!(CLIENT_REAP_INTERVAL < STREAM_STALL_TIMEOUT);
     }
 }

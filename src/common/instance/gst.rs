@@ -282,7 +282,10 @@ impl NeoInstance {
                         loop {
                             match media_stream.get_data().await {
                                 Ok(Ok(media)) => {
-                                    if waiting_for_keyframe && media.is_video() && !media.is_keyframe() {
+                                    if waiting_for_keyframe
+                                        && media.is_video()
+                                        && !media.is_keyframe()
+                                    {
                                         continue;
                                     }
                                     let is_keyframe = media.is_keyframe();
@@ -300,7 +303,11 @@ impl NeoInstance {
                                                 "OBSERVE: Queue-full drop stream={:?} media={}{}",
                                                 stream,
                                                 media_kind_str(&m),
-                                                if m.is_video() { ", resyncing at next keyframe" } else { "" }
+                                                if m.is_video() {
+                                                    ", resyncing at next keyframe"
+                                                } else {
+                                                    ""
+                                                }
                                             );
                                         }
                                         Err(TrySendError::Closed(_)) => {
@@ -313,7 +320,8 @@ impl NeoInstance {
                                     log::debug!("Recovered from stream error: {:?}", e);
                                 }
                                 Err(CoreError::StreamFinished) => {
-                                    return Err(CoreError::DroppedConnection.into());
+                                    log::info!("{stream:?}: camera video stream ended");
+                                    return Ok(());
                                 }
                                 Err(e) => {
                                     return Err(e.into());

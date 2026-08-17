@@ -228,7 +228,11 @@ pub(crate) struct CameraConfig {
     /// setting `format = "h264"`; it is still accepted (so those configs load
     /// with `deny_unknown_fields`) but has no effect. A warning is logged if
     /// present — see [`CameraConfig::warn_deprecated`].
-    #[serde(default, alias = "video_format", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "video_format",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) format: Option<String>,
 }
 
@@ -596,8 +600,8 @@ mod tests {
     fn unknown_key_is_rejected() {
         // A typo'd/unknown key (here a misspelling of `buffer_duration`) must now
         // fail loudly instead of being silently ignored.
-        let err = parse_camera("bufffer_duration = 5000")
-            .expect_err("unknown key should be rejected");
+        let err =
+            parse_camera("bufffer_duration = 5000").expect_err("unknown key should be rejected");
         assert!(
             err.to_string().contains("bufffer_duration")
                 || err.to_string().contains("unknown field"),
