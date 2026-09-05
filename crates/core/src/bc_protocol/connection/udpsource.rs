@@ -39,7 +39,11 @@ const MTU: usize = 1350;
 const UDPDATA_HEADER_SIZE: usize = 20;
 const SOCKET_CHANNEL_CAPACITY: usize = 2000;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_millis(250);
-const UDP_RECV_TIMEOUT: Duration = Duration::from_secs(45);
+/// Declare the UDP session dead after this much total silence (no data, ack
+/// or heartbeat). The camera heartbeats every second, so 15s of nothing means
+/// the link is gone; the previous 45s delayed every Lumus reconnect by half a
+/// minute on top of the outage itself.
+const UDP_RECV_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) type InnerFramed = Framed<Compat<IntoAsyncRead<UdpPayloadSource>>, BcCodex>;
 pub(crate) struct UdpSource {

@@ -238,7 +238,7 @@ impl BcCamera {
 
                 tokio::select! {
                     _ = abort_handle_thread.cancelled() => {},
-                    _ = async {
+                    v = async {
                         let result: Result<()> = loop {
                             tokio::select! {
                                 _ = stream_health.tick() => {
@@ -252,20 +252,43 @@ impl BcCamera {
                                     );
                                 }
                                 _ = stall_check.tick() => {
-                                    if !stall_warned && last_media.elapsed() >= STREAM_NO_FRAME_WARN_TIMEOUT {
+                                    // The hard stall timeout lives here, driven by
+                                    // `last_media`, rather than as a `timeout()` around
+                                    // `media_sub.next()`: a `select!` rebuilds every
+                                    // branch future each iteration, so a timeout wrapped
+                                    // around the media future was reset by this very
+                                    // 1s tick and could never fire.
+                                    let idle = last_media.elapsed();
+                                    if idle >= STREAM_NO_FRAME_TIMEOUT {
+                                        log::warn!(
+                                            "{camera_name}::{stream:?}: stream stalled: no media for {:?} after {} frames (video={}, audio={}), rebuilding session",
+                                            idle,
+                                            frames_total,
+                                            frames_video,
+                                            frames_audio
+                                        );
+                                        break Err(Error::TimeoutDisconnected);
+                                    }
+                                    if !stall_warned && idle >= STREAM_NO_FRAME_WARN_TIMEOUT {
                                         stall_warned = true;
                                         log::warn!(
                                             "{camera_name}::{stream:?}: stream idle for {:?} without media yet (video={}, audio={}), will reconnect if this reaches {:?}",
-                                            last_media.elapsed(),
+                                            idle,
                                             frames_video,
                                             frames_audio,
                                             STREAM_NO_FRAME_TIMEOUT
                                         );
                                     }
                                 }
-                                media = timeout(STREAM_NO_FRAME_TIMEOUT, media_sub.next()) => {
+                                media = media_sub.next() => {
                                     match media {
-                                        Ok(Some(bc_media)) => {
+                                        Some(bc_media) => {
+                                            if stall_warned {
+                                                log::info!(
+                                                    "{camera_name}::{stream:?}: stream resumed after {:?} stall",
+                                                    last_media.elapsed()
+                                                );
+                                            }
                                             stall_warned = false;
                                             frames_total += 1;
                                             if let Ok(ref media) = bc_media {
@@ -285,23 +308,17 @@ impl BcCamera {
                                                 break Ok(());
                                             }
                                         }
-                                        Ok(None) => break Ok(()),
-                                        Err(_) => {
-                                            log::warn!(
-                                                "{camera_name}::{stream:?}: stream stalled: no media for {:?} after {} frames (video={}, audio={}), rebuilding session",
-                                                STREAM_NO_FRAME_TIMEOUT,
-                                                frames_total,
-                                                frames_video,
-                                                frames_audio
-                                            );
-                                            break Err(Error::TimeoutDisconnected);
-                                        }
+                                        None => break Ok(()),
                                     }
                                 }
                             }
                         };
                         result
-                    } => {}
+                    } => {
+                        if let Err(e) = v {
+                            log::debug!("{camera_name}::{stream:?}: media loop ended with {:?}", e);
+                        }
+                    }
                 }
 
                 log::info!(
