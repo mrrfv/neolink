@@ -588,6 +588,7 @@ impl Discoverer {
         let local_ip = get_local_ip()?;
         let local_addr = SocketAddr::new(local_ip, self.local_addr().port());
         log::debug!("Registering {:?} to reolink", local_addr);
+        warn_if_container_address(local_ip);
         let local_ip = local_addr.ip();
         let local_port = local_addr.port();
         let local_family = if local_addr.ip().is_ipv4() { 4 } else { 6 };
@@ -1346,6 +1347,26 @@ impl Discovery {
             client_id: self.client_id,
             camera_id: connect_result.camera_id,
         })
+    }
+}
+
+/// Warn (once per process) when the address we register with Reolink is on a
+/// container bridge network. Cameras on the LAN cannot reach it, so the
+/// device-initiated discovery paths and broadcast discovery will never work
+/// and every connect depends on the Reolink cloud answering.
+fn warn_if_container_address(ip: std::net::IpAddr) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let std::net::IpAddr::V4(v4) = ip else {
+        return;
+    };
+    let [a, b, _, _] = v4.octets();
+    // podman default (10.88/16, 10.89/16) and docker default (172.16/12)
+    let looks_like_container = (a == 10 && (b == 88 || b == 89)) || (a == 172 && (16..=31).contains(&b));
+    if looks_like_container && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::warn!(
+            "Registering {} with Reolink: this looks like a container bridge address that the camera cannot reach. Local discovery will fail and every reconnect will go through Reolink's servers. For battery/WiFi cameras run neolink with host networking (e.g. `--network=host`).",
+            ip
+        );
     }
 }
 

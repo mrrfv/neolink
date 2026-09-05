@@ -233,7 +233,19 @@ impl BcCamera {
                             );
                             Ok(CameraLocation::Udp(disc))
                         },
-                        Err(e) => Err(e)
+                        Err(e) => {
+                            // Previously silent, which hid the most common
+                            // reason a LAN camera reconnects slowly: the
+                            // camera never answers local discovery (typically
+                            // because neolink runs on a container bridge
+                            // network) and every connect falls back to the
+                            // Reolink cloud.
+                            info!(
+                                "{}: Local discovery failed ({:?}); relying on Reolink cloud discovery",
+                                options.name, e
+                            );
+                            Err(e)
+                        }
                     }
                 }, if allow_local => Ok(v),
                 Ok(v) = async {
