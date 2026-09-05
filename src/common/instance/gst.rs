@@ -273,8 +273,25 @@ impl NeoInstance {
         let config = self.config().await?.borrow().clone();
         let strict = config.strict;
         let thread_camera = self.clone();
+        // Held outside the task closure so we can notice the RTSP layer
+        // dropping its receiver while we are blocked inside `run_task`
+        // (e.g. waiting for the camera to reconnect). Without this a stream
+        // task that was replaced during an outage lived on as a zombie until
+        // the camera came back, at which point every zombie issued its own
+        // `start_video` before discovering its channel was closed.
+        let closed_tx = media_tx.clone();
         tokio::task::spawn(async move {
-            let result = thread_camera
+            let name = thread_camera
+                .config()
+                .await
+                .map(|c| c.borrow().name.clone())
+                .unwrap_or_default();
+            let result = tokio::select! {
+                _ = closed_tx.closed() => {
+                    log::debug!("{name}::{stream:?}: stream consumer gone, ending stream task");
+                    AnyResult::Ok(())
+                }
+                v = thread_camera
                 .run_task(move |cam| {
                     let media_tx = media_tx.clone();
                     Box::pin(async move {
@@ -330,22 +347,40 @@ impl NeoInstance {
                                     }
                                 }
                                 Ok(Err(e)) => {
-                                    log::debug!("Recovered from stream error: {:?}", e);
+                                    // A media packet failed to parse. Whatever
+                                    // was lost may have been video, so resume
+                                    // only at the next keyframe.
+                                    log::debug!("Recovered from stream error, resyncing at next keyframe: {:?}", e);
+                                    waiting_for_keyframe = true;
                                 }
                                 Err(CoreError::StreamFinished) => {
                                     log::info!("{stream:?}: camera video stream ended");
                                     return Ok(());
                                 }
                                 Err(e) => {
-                                    return Err(e.into());
+                                    // Any other failure (dropped connection,
+                                    // stall timeout, ...) also ends this task
+                                    // instead of retrying inside `run_task` on
+                                    // the same channel. Ending the task closes
+                                    // the channel, so the RTSP factory reopens
+                                    // the stream through its normal path:
+                                    // generation bump, DISCONT, keyframe wait.
+                                    // Retrying silently here resumed the same
+                                    // channel after a reconnect with no resync,
+                                    // which is where A/V drift crept in.
+                                    log::info!(
+                                        "{stream:?}: camera video stream errored, ending stream so it is reopened cleanly: {:?}",
+                                        e
+                                    );
+                                    return Ok(());
                                 }
                             }
                         }
                     })
-                })
-                .await;
+                }) => v,
+            };
 
-            log::debug!("Camera finished streaming: {result:?}");
+            log::debug!("{name}::{stream:?}: camera finished streaming: {result:?}");
         });
 
         Ok(media_rx)

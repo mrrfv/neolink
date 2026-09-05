@@ -95,6 +95,12 @@ const REOPEN_MAX_DELAY: Duration = Duration::from_secs(30);
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// How often to sweep stale RTSP clients when the camera is quiet.
 const CLIENT_REAP_INTERVAL: Duration = Duration::from_secs(5);
+/// If the audio output clock falls this far behind the video output clock, snap
+/// it forward (never backward) so a reconnect gap never turns into permanent
+/// A/V lag for a connected client.
+const MAX_AV_SKEW: Duration = Duration::from_secs(1);
+/// Used for the "audio running ahead" observability log only.
+const AV_AHEAD_WARN: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -266,6 +272,40 @@ impl TimestampState {
         // next_video_ts and next_audio_ts are intentionally preserved so the
         // output clock stays monotonic across the reconnect.
     }
+
+    /// Keep the audio output clock from lagging the video output clock.
+    ///
+    /// Video PTS follows the camera's (wall-clock based) frame timestamps, so
+    /// after a gap it moves forward by the real elapsed time. Audio PTS is a
+    /// running sum of packet durations and does not. Left alone, every gap
+    /// pushes audio further behind video for the lifetime of the client. When
+    /// audio is more than `MAX_AV_SKEW` behind, jump it forward to the video
+    /// clock and flag a discontinuity. Audio is never moved backwards.
+    ///
+    /// Returns true if the audio clock was adjusted.
+    fn align_audio_to_video(&mut self) -> bool {
+        if self.next_video_ts.is_zero() {
+            // No video sent yet on this client; nothing to align against.
+            return false;
+        }
+        if self.next_audio_ts + MAX_AV_SKEW < self.next_video_ts {
+            log::info!(
+                "OBSERVE: audio clock {:?} behind video, snapping forward to {:?}",
+                self.next_video_ts - self.next_audio_ts,
+                self.next_video_ts
+            );
+            self.next_audio_ts = self.next_video_ts;
+            self.audio_needs_discont = true;
+            return true;
+        }
+        if self.next_video_ts + AV_AHEAD_WARN < self.next_audio_ts {
+            log::debug!(
+                "OBSERVE: audio clock {:?} ahead of video",
+                self.next_audio_ts - self.next_video_ts
+            );
+        }
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -322,20 +362,29 @@ fn reap_finished_handles(handles: &mut Vec<std::thread::JoinHandle<AnyResult<()>
     *handles = still_running;
 }
 
+/// Reap clients whose sender thread finished, and cancel clients that have
+/// not accepted media for `CLIENT_IDLE_TIMEOUT`.
+///
+/// `camera_delivering` must be false while the camera itself has been silent
+/// for that long: then *no* client has activity, and cancelling them would turn
+/// a camera outage into a pile of RTSP sessions with no feeder thread (the
+/// client keeps its session, gets nothing, and has to time out and reconnect).
 fn reap_stale_clients(
     clients: &mut Vec<ClientState>,
     old_thread_handles: &mut Vec<std::thread::JoinHandle<AnyResult<()>>>,
     stream_name: &str,
+    camera_delivering: bool,
 ) {
     let mut still_open = Vec::with_capacity(clients.len());
     let now = Instant::now();
 
     for client in clients.drain(..) {
-        let stale = client
-            .last_activity
-            .lock()
-            .map(|last| now.duration_since(*last) > CLIENT_IDLE_TIMEOUT)
-            .unwrap_or(true);
+        let stale = camera_delivering
+            && client
+                .last_activity
+                .lock()
+                .map(|last| now.duration_since(*last) > CLIENT_IDLE_TIMEOUT)
+                .unwrap_or(true);
         let finished = client
             .thread_handle
             .as_ref()
@@ -490,6 +539,13 @@ pub(super) async fn make_factory(
         let mut client_reap = interval(CLIENT_REAP_INTERVAL);
         client_reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_media_received = Instant::now();
+        // Connection state of the underlying camera. While it is disconnected
+        // the camera thread is already reconnecting and the pending stream
+        // task is waiting for it; re-requesting the stream every stall
+        // interval would only pile up start requests for the camera to sort
+        // out when it comes back.
+        let mut camera_watch = camera.camera();
+        let mut logged_waiting_for_camera = false;
 
         // Reopening the upstream camera stream can back off for many seconds.
         // It MUST NOT be awaited inline in the select! below, or new RTSP
@@ -504,10 +560,22 @@ pub(super) async fn make_factory(
         macro_rules! trigger_reopen {
             ($reason:expr) => {{
                 if !reopening {
-                    log::warn!("{name}::{stream}: {}, restarting stream", $reason);
+                    log::warn!("{name}::{stream}: {}, re-requesting stream", $reason);
                     reopening = true;
                     waiting_for_keyframe = true;
-                    buffer.clear();
+                    // Drop the old receiver right now so the previous stream
+                    // task ends immediately (it selects on the channel being
+                    // closed) instead of lingering until the camera returns.
+                    media_rx = {
+                        let (_closed_tx, closed_rx) = tokio::sync::mpsc::channel::<BcMedia>(1);
+                        closed_rx
+                    };
+                    // `buffer` (the last GOP) is intentionally kept: a client
+                    // that connects during the outage can preroll from it, so
+                    // DESCRIBE answers immediately instead of hanging until
+                    // the camera is back. The sender threads flag DISCONT and
+                    // reset source-timestamp tracking on the generation bump,
+                    // so replaying a stale GOP is safe.
                     timestamps_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
                     let reopen_camera = camera.clone();
                     let reopen_name = name.clone();
@@ -523,15 +591,36 @@ pub(super) async fn make_factory(
         loop {
             tokio::select! {
                 _ = client_reap.tick() => {
-                    reap_stale_clients(&mut clients, &mut old_thread_handles, &name);
+                    let camera_delivering = last_media_received.elapsed() < CLIENT_IDLE_TIMEOUT;
+                    reap_stale_clients(&mut clients, &mut old_thread_handles, &name, camera_delivering);
                     if !reopening && last_media_received.elapsed() >= STREAM_STALL_TIMEOUT {
-                        trigger_reopen!(format!(
-                            "no media received for {STREAM_STALL_TIMEOUT:?}"
-                        ));
+                        let camera_connected = camera_watch.borrow().upgrade().is_some();
+                        if camera_connected {
+                            logged_waiting_for_camera = false;
+                            trigger_reopen!(format!(
+                                "no media received for {STREAM_STALL_TIMEOUT:?}"
+                            ));
+                        } else if !logged_waiting_for_camera {
+                            logged_waiting_for_camera = true;
+                            log::info!(
+                                "{name}::{stream}: no media for {:?} and camera is disconnected; waiting for it to reconnect",
+                                last_media_received.elapsed()
+                            );
+                        }
+                    }
+                }
+                Ok(()) = camera_watch.changed() => {
+                    let connected = camera_watch.borrow_and_update().upgrade().is_some();
+                    if connected {
+                        // Give the fresh connection a full stall interval to
+                        // deliver before we consider re-requesting.
+                        last_media_received = Instant::now();
+                        logged_waiting_for_camera = false;
+                        log::debug!("{name}::{stream}: camera reconnected, waiting for stream to deliver");
                     }
                 }
                 Some(new_rx) = reopen_rx.recv(), if reopening => {
-                    log::info!("{name}::{stream}: camera stream reopened");
+                    log::info!("{name}::{stream}: camera stream re-requested, waiting for first keyframe");
                     media_rx = new_rx;
                     last_media_received = Instant::now();
                     reopening = false;
@@ -890,6 +979,7 @@ fn send_to_sources(
             if let Some(duration) = aac.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
                     let pkt_duration = Duration::from_micros(duration as u64);
+                    timestamps.align_audio_to_video();
                     let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
                     let sent = send_to_appsrc(
                         aud_src,
@@ -912,6 +1002,7 @@ fn send_to_sources(
             if let Some(duration) = adpcm.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
                     let pkt_duration = Duration::from_micros(duration as u64);
+                    timestamps.align_audio_to_video();
                     let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
                     let sent = send_to_appsrc(
                         aud_src,
@@ -2068,6 +2159,49 @@ mod tests {
         assert!(needs_keyframe);
         assert_eq!(batch.len(), 1);
         assert!(matches!(batch.first(), Some(BcMedia::Pframe(_))));
+    }
+
+    #[test]
+    fn test_audio_snaps_forward_when_behind_video() {
+        let mut ts = TimestampState {
+            next_video_ts: Duration::from_secs(30),
+            next_audio_ts: Duration::from_secs(20),
+            ..Default::default()
+        };
+        ts.audio_needs_discont = false;
+        assert!(ts.align_audio_to_video());
+        assert_eq!(ts.next_audio_ts, Duration::from_secs(30));
+        assert!(ts.audio_needs_discont, "a snap must be flagged as a discontinuity");
+    }
+
+    #[test]
+    fn test_audio_never_moved_backwards_or_within_tolerance() {
+        // Audio ahead of video: leave it alone (moving it back would produce
+        // non-monotonic timestamps).
+        let mut ahead = TimestampState {
+            next_video_ts: Duration::from_secs(10),
+            next_audio_ts: Duration::from_secs(15),
+            ..Default::default()
+        };
+        assert!(!ahead.align_audio_to_video());
+        assert_eq!(ahead.next_audio_ts, Duration::from_secs(15));
+
+        // Behind but within tolerance: leave it alone.
+        let mut close = TimestampState {
+            next_video_ts: Duration::from_secs(10),
+            next_audio_ts: Duration::from_millis(9500),
+            ..Default::default()
+        };
+        assert!(!close.align_audio_to_video());
+        assert_eq!(close.next_audio_ts, Duration::from_millis(9500));
+
+        // No video yet: nothing to align against.
+        let mut no_video = TimestampState {
+            next_audio_ts: Duration::from_secs(5),
+            ..Default::default()
+        };
+        assert!(!no_video.align_audio_to_video());
+        assert_eq!(no_video.next_audio_ts, Duration::from_secs(5));
     }
 
     #[test]
