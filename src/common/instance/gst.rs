@@ -187,6 +187,10 @@ impl NeoInstance {
                             // we never forward a dangling P-frame downstream.
                             let mut waiting_for_keyframe = false;
                             while let Some(media) = media_stream.recv().await {
+                                if matches!(media, BcMedia::Discont) {
+                                    waiting_for_keyframe = true;
+                                    continue;
+                                }
                                 if waiting_for_keyframe && media.is_video() && !media.is_keyframe() {
                                     continue;
                                 }
@@ -282,6 +286,15 @@ impl NeoInstance {
                         loop {
                             match media_stream.get_data().await {
                                 Ok(Ok(media)) => {
+                                    if matches!(media, BcMedia::Discont) {
+                                        // The decoder skipped corrupt/missing
+                                        // bytes; resume at the next keyframe.
+                                        log::debug!(
+                                            "{stream:?}: media discontinuity, resyncing at next keyframe"
+                                        );
+                                        waiting_for_keyframe = true;
+                                        continue;
+                                    }
                                     if waiting_for_keyframe
                                         && media.is_video()
                                         && !media.is_keyframe()

@@ -309,10 +309,12 @@ struct UdpPayloadInner {
     packets_want: u32,
     sent: BTreeMap<u32, UdpData>,
     recieved: BTreeMap<u32, Vec<u8>>,
-    /// When the head-of-line packet (`packets_want`) first went missing while
-    /// later packets kept arriving. Used to bound how long we wait for the
-    /// camera to resend a lost packet before declaring the gap unrecoverable.
-    reorder_gap_since: Option<Instant>,
+    /// The head-of-line packet id that is currently missing while later
+    /// packets keep arriving, and when it first went missing. Bounds how long
+    /// we wait for the camera to resend before skipping the hole.
+    reorder_gap: Option<(u32, Instant)>,
+    /// Number of holes skipped over the life of this session (logged).
+    gaps_skipped: u32,
     /// Offical Client does ack every 10ms if we don't also do this the camera
     /// seems to think we have a poor connection and will abort
     /// This `ack_interval` controls how ofen we do this
@@ -488,7 +490,8 @@ impl UdpPayloadInner {
             packets_want: 0,
             sent: Default::default(),
             recieved: Default::default(),
-            reorder_gap_since: None,
+            reorder_gap: None,
+            gaps_skipped: 0,
             resend_interval: interval(Duration::from_millis(500)), // Offical Client does resend every 500ms
             ack_latency: Default::default(),
             cancel,
@@ -569,38 +572,86 @@ impl UdpPayloadInner {
         }?;
         log::trace!("Send");
 
-        // Deliver every contiguous packet we have to the consumer.
-        while let Some(payload) = self.recieved.remove(&self.packets_want) {
-            log::trace!("  + {}", self.packets_want);
-            self.packets_want += 1;
-            self.thread_stream.feed(Ok(payload)).await?;
-        }
-
+        // Deliver every contiguous packet we have to the consumer, and deal
+        // with a missing head-of-line packet.
+        //
         // If packets remain buffered after draining, we are blocked on a
-        // missing head-of-line packet (`packets_want`) while later packets keep
-        // arriving. The camera resends unacked packets every 500ms, so a
-        // short-lived hole recovers on its own. If it does NOT recover, the old
-        // behaviour force-advanced `packets_want` past the gap — splicing
-        // non-contiguous bytes together, which desyncs the length-prefixed BC
-        // framer and corrupts the elementary stream in a way that is hard to
-        // recover from. Instead, bound the wait by both buffered size (to cap
-        // memory) and elapsed time, then surface a recoverable error. That
-        // tears the UDP session down cleanly so the connection reconnects and
-        // video resumes on a fresh keyframe rather than on garbage.
+        // missing packet (`packets_want`) while later packets keep arriving.
+        // The camera is supposed to resend unacked packets, so a short-lived
+        // hole recovers on its own. If it does not, bound the wait by both
+        // buffered size (to cap memory) and elapsed time, then skip the hole.
+        // Skipping splices non-contiguous bytes together; the BC framer
+        // (`BcCodex`) resynchronises at the next message magic and the media
+        // decoder emits a `Discont` so video resumes at the next keyframe. That
+        // is a glitch of at most one GOP. The previous behaviour tore the whole
+        // camera connection down for every lost packet, which on a Lumus over
+        // WiFi meant a 15-75s outage plus the downstream NVR's reconnect dance.
         const MAX_REORDER_BUFFER: usize = 1024; // ~1.3MB at 1350 bytes per packet
         const MAX_REORDER_GAP: Duration = Duration::from_secs(5);
-        if self.recieved.is_empty() {
-            self.reorder_gap_since = None;
-        } else {
-            let gap_since = *self.reorder_gap_since.get_or_insert_with(Instant::now);
-            let buffered = self.recieved.len();
-            let waited = gap_since.elapsed();
-            if buffered > MAX_REORDER_BUFFER || waited > MAX_REORDER_GAP {
-                log::warn!(
-                    "UDP reorder gap unrecoverable: missing packet {} with {} later packets buffered ({:?} waited). Reconnecting to resync.",
-                    self.packets_want, buffered, waited
-                );
-                return Err(Error::BcUdpTimeout);
+        /// Gaps shorter than this are ordinary reordering; log them at trace.
+        const GAP_LOG_THRESHOLD: Duration = Duration::from_millis(500);
+        loop {
+            while let Some(payload) = self.recieved.remove(&self.packets_want) {
+                log::trace!("  + {}", self.packets_want);
+                self.packets_want += 1;
+                self.thread_stream.feed(Ok(payload)).await?;
+            }
+
+            let Some(&first_buffered) = self.recieved.keys().next() else {
+                // Fully contiguous again.
+                if let Some((missing, since)) = self.reorder_gap.take() {
+                    let waited = since.elapsed();
+                    if waited >= GAP_LOG_THRESHOLD {
+                        log::info!(
+                            "UDP reorder gap recovered: packet {} arrived after {:?}",
+                            missing,
+                            waited
+                        );
+                    } else {
+                        log::trace!("UDP reorder of packet {} resolved after {:?}", missing, waited);
+                    }
+                }
+                break;
+            };
+
+            match self.reorder_gap {
+                Some((missing, since)) if missing == self.packets_want => {
+                    let buffered = self.recieved.len();
+                    let waited = since.elapsed();
+                    if buffered > MAX_REORDER_BUFFER || waited > MAX_REORDER_GAP {
+                        self.gaps_skipped += 1;
+                        log::warn!(
+                            "UDP reorder gap unrecoverable: packets {}..={} never arrived ({} later packets buffered, {:?} waited, {} gaps skipped this session). Skipping the hole; the stream will resync at the next message boundary.",
+                            self.packets_want,
+                            first_buffered.saturating_sub(1),
+                            buffered,
+                            waited,
+                            self.gaps_skipped
+                        );
+                        self.packets_want = first_buffered;
+                        self.reorder_gap = None;
+                        // Drain what we have after the hole.
+                        continue;
+                    }
+                    break;
+                }
+                previous => {
+                    if let Some((missing, since)) = previous {
+                        // The earlier hole was filled but a later one opened.
+                        log::info!(
+                            "UDP reorder gap recovered: packet {} arrived after {:?}",
+                            missing,
+                            since.elapsed()
+                        );
+                    }
+                    self.reorder_gap = Some((self.packets_want, Instant::now()));
+                    log::debug!(
+                        "UDP head-of-line packet {} missing, {} later packets buffered",
+                        self.packets_want,
+                        self.recieved.len()
+                    );
+                    break;
+                }
             }
         }
         log::trace!("recieved: {}", self.recieved.len());

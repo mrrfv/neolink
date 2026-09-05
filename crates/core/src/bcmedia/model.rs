@@ -15,6 +15,10 @@ pub enum BcMedia {
     Adpcm(BcMediaAdpcm),
     /// Internal variant to skip markers/NULLs
     Skip,
+    /// The decoder lost bytes (corrupt or missing packets) and resynchronised
+    /// at the next frame boundary. Whatever was in the gap is gone, so video
+    /// consumers must wait for the next keyframe before forwarding again.
+    Discont,
 }
 impl BcMedia {
     /// True if this is a video keyframe (I-frame) — an independently decodable

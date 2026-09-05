@@ -13,6 +13,11 @@ pub struct BcMediaCodex {
     /// in the event that the stream appears to be corrupted
     strict: bool,
     amount_skipped: usize,
+    /// Set once bytes have been skipped; the next good frame is preceded by a
+    /// `BcMedia::Discont` so consumers resync at a keyframe.
+    discont_pending: bool,
+    /// Frame held back while `Discont` is emitted first.
+    pending: Option<BcMedia>,
 }
 
 impl BcMediaCodex {
@@ -20,6 +25,8 @@ impl BcMediaCodex {
         Self {
             strict,
             amount_skipped: 0,
+            discont_pending: false,
+            pending: None,
         }
     }
 }
@@ -49,6 +56,9 @@ impl Decoder for BcMediaCodex {
     }
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
+        if let Some(held) = self.pending.take() {
+            return Ok(Some(held));
+        }
         loop {
             match BcMedia::deserialize(src) {
                 Ok(BcMedia::Skip) => {
@@ -62,6 +72,11 @@ impl Decoder for BcMediaCodex {
                     if self.amount_skipped > 0 {
                         trace!("Amount skipped to restore stream: {}", self.amount_skipped);
                         self.amount_skipped = 0;
+                    }
+                    if self.discont_pending {
+                        self.discont_pending = false;
+                        self.pending = Some(bc);
+                        return Ok(Some(BcMedia::Discont));
                     }
                     return Ok(Some(bc));
                 }
@@ -82,6 +97,7 @@ impl Decoder for BcMediaCodex {
                             debug!("Error in stream attempting to restore");
                             trace!("   Stream Error: {:?}", e);
                         }
+                        self.discont_pending = true;
                         // Resync by advancing one byte and letting the parser
                         // re-validate at the next offset. The frame magics are
                         // strongly validated (I/P frames require a following
@@ -101,5 +117,63 @@ impl Decoder for BcMediaCodex {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn iframe_sample() -> Vec<u8> {
+        [
+            include_bytes!("samples/iframe_0.raw").as_ref(),
+            include_bytes!("samples/iframe_1.raw").as_ref(),
+            include_bytes!("samples/iframe_2.raw").as_ref(),
+            include_bytes!("samples/iframe_3.raw").as_ref(),
+            include_bytes!("samples/iframe_4.raw").as_ref(),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn non_strict_emits_discont_then_frames_after_garbage() {
+        let frame = iframe_sample();
+        let mut raw = vec![0x42u8; 17];
+        raw.extend_from_slice(&frame);
+        raw.extend_from_slice(&frame);
+        let mut buf = BytesMut::from(&raw[..]);
+        let mut codex = BcMediaCodex::new(false);
+        assert!(matches!(
+            codex.decode(&mut buf).unwrap(),
+            Some(BcMedia::Discont)
+        ));
+        assert!(matches!(
+            codex.decode(&mut buf).unwrap(),
+            Some(BcMedia::Iframe(_))
+        ));
+        assert!(matches!(
+            codex.decode(&mut buf).unwrap(),
+            Some(BcMedia::Iframe(_))
+        ));
+        assert!(codex.decode(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn clean_stream_has_no_discont() {
+        let frame = iframe_sample();
+        let mut buf = BytesMut::from(&frame[..]);
+        let mut codex = BcMediaCodex::new(false);
+        assert!(matches!(
+            codex.decode(&mut buf).unwrap(),
+            Some(BcMedia::Iframe(_))
+        ));
+        assert!(codex.decode(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn strict_errors_on_garbage() {
+        let mut buf = BytesMut::from(&[0x42u8; 17][..]);
+        let mut codex = BcMediaCodex::new(true);
+        assert!(codex.decode(&mut buf).is_err());
     }
 }

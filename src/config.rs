@@ -516,7 +516,7 @@ fn default_pause_mode() -> String {
 }
 
 fn default_strict() -> bool {
-    true
+    false
 }
 
 fn default_pause() -> PauseConfig {

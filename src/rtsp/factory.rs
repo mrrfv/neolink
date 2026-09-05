@@ -205,7 +205,7 @@ impl StreamConfig {
             | BcMedia::Pframe(BcMediaPframe { video_type, .. }) => {
                 self.vid_type = Some(*video_type);
             }
-            BcMedia::Skip => {}
+            BcMedia::Skip | BcMedia::Discont => {}
         }
     }
 }
