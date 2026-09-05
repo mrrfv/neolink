@@ -608,7 +608,11 @@ impl UdpPayloadInner {
                             waited
                         );
                     } else {
-                        log::trace!("UDP reorder of packet {} resolved after {:?}", missing, waited);
+                        log::trace!(
+                            "UDP reorder of packet {} resolved after {:?}",
+                            missing,
+                            waited
+                        );
                     }
                 }
                 break;

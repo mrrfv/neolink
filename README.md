@@ -424,8 +424,12 @@ ssue a user had)
 - **print_format:** Used for adjusting printing of some values mostly, battery
 messages
 - **protocol:** Controls the underlying Baichuan transport. `Udp` is the default, `Tcp` is useful on especially noisy LANs, and `TcpUdp` lets NeoLink try both. If you only configure an address and no `uid`, NeoLink falls back to `Tcp` because UDP discovery needs a UID.
-- **audio_passthrough:** Send the camera's AAC audio through RTSP unchanged (`MPEG4-GENERIC`, one RTP packet per frame) instead of decoding it to raw L16 PCM. Default `true`. See [Frigate / go2rtc](#frigate--go2rtc).
-- **strict:** Default `false`: a corrupt or partially lost media packet is skipped and video resumes at the next keyframe. `true` ends the stream on the first bad packet so it has to be restarted from the camera.
+- **audio_passthrough:** Send the camera's AAC audio through RTSP unchanged
+  (`MPEG4-GENERIC`, one RTP packet per frame) instead of decoding it to raw L16
+  PCM. Default `true`. See [Frigate / go2rtc](#frigate--go2rtc).
+- **strict:** Default `false`: a corrupt or partially lost media packet is
+  skipped and video resumes at the next keyframe. `true` ends the stream on the
+  first bad packet so it has to be restarted from the camera.
 
 ### Pause
 

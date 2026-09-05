@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -32,14 +31,6 @@ use crate::{
 /// which is larger than video (2 seconds) to ensure smooth playback.
 /// Formula: 512 packets × 1416 bytes/packet ≈ 725KB
 const AUDIO_BUFFER_SIZE: u32 = 512 * 1416;
-
-/// Maximum number of buffer pools to maintain
-///
-/// Buffer pools are keyed by frame size. Video frames typically cluster around
-/// a few common sizes (I-frames ~50-100KB, P-frames ~5-20KB), so 32 pools
-/// should be more than sufficient. This prevents memory leaks from cameras
-/// with highly variable frame sizes.
-const MAX_BUFFER_POOLS: usize = 32;
 
 /// How long to wait for the first video packet before failing stream startup.
 const INITIAL_VIDEO_TIMEOUT: Duration = Duration::from_secs(20);
@@ -220,15 +211,44 @@ impl StreamConfig {
     }
 }
 
+/// How long the RTSP server thread waits for the factory loop to hand back a
+/// built pipeline before it gives up on that client request.
+const CLIENT_BUILD_TIMEOUT: Duration = Duration::from_secs(2);
+
 enum ClientMsg {
     NewClient {
         element: Element,
         reply: std::sync::mpsc::SyncSender<AnyResult<Element>>,
+        /// After this instant the RTSP server has stopped waiting for `reply`
+        /// and discarded `element`; building a pipeline for it would only
+        /// create an orphan sender thread.
+        deadline: Instant,
     },
 }
 
+/// A parsed frame shared, without copying, between the bootstrap buffer and
+/// every client's queue and GStreamer buffer.
+type SharedMedia = Arc<BcMedia>;
+
+/// `AsRef<[u8]>` view of a frame's payload so `gst::Buffer::from_slice` can
+/// wrap the shared allocation directly instead of copying it into a pool.
+#[derive(Clone)]
+struct FramePayload(SharedMedia);
+
+impl AsRef<[u8]> for FramePayload {
+    fn as_ref(&self) -> &[u8] {
+        match &*self.0 {
+            BcMedia::Iframe(frame) => &frame.data,
+            BcMedia::Pframe(frame) => &frame.data,
+            BcMedia::Aac(frame) => &frame.data,
+            BcMedia::Adpcm(frame) => &frame.data,
+            _ => &[],
+        }
+    }
+}
+
 struct ClientState {
-    sender: tokio::sync::mpsc::Sender<BcMedia>,
+    sender: tokio::sync::mpsc::Sender<SharedMedia>,
     thread_handle: Option<std::thread::JoinHandle<AnyResult<()>>>,
     cancel: CancellationToken,
     last_activity: Arc<Mutex<Instant>>,
@@ -318,18 +338,15 @@ enum FrameSendOutcome {
     DroppedVideo,
 }
 
-fn buffer_media(buffer: &mut Vec<BcMedia>, media: BcMedia) {
-    if matches!(media, BcMedia::Iframe(_)) {
+fn buffer_media(buffer: &mut Vec<SharedMedia>, media: SharedMedia) {
+    if media.is_keyframe() {
         buffer.clear();
     }
 
     buffer.push(media);
 
     if buffer.len() > MAX_BOOTSTRAP_FRAMES {
-        if let Some(last_iframe) = buffer
-            .iter()
-            .rposition(|item| matches!(item, BcMedia::Iframe(_)))
-        {
+        if let Some(last_iframe) = buffer.iter().rposition(|item| item.is_keyframe()) {
             if last_iframe > 0 {
                 let _ = buffer.drain(0..last_iframe);
                 return;
@@ -510,7 +527,7 @@ pub(super) async fn make_factory(
                 match timeout(wait_for, media_rx.recv()).await {
                     Ok(Some(media)) => {
                         stream_config.update_from_media(&media);
-                        buffer_media(&mut buffer, media);
+                        buffer_media(&mut buffer, Arc::new(media));
                     }
                     Ok(None) => {
                         log::warn!(
@@ -633,6 +650,7 @@ pub(super) async fn make_factory(
                     match media_opt {
                         Some(media) => {
                             last_media_received = Instant::now();
+                            let media: SharedMedia = Arc::new(media);
                             stream_config.update_from_media(&media);
                             if waiting_for_keyframe {
                                 if !is_keyframe(&media) {
@@ -648,7 +666,7 @@ pub(super) async fn make_factory(
                                 waiting_for_keyframe = false;
                             }
 
-                            buffer_media(&mut buffer, media.clone());
+                            buffer_media(&mut buffer, Arc::clone(&media));
 
                             if !clients.is_empty() {
                                 let mut still_open = Vec::with_capacity(clients.len());
@@ -666,7 +684,7 @@ pub(super) async fn make_factory(
                                         continue;
                                     }
 
-                                    match client.sender.try_send(media.clone()) {
+                                    match client.sender.try_send(Arc::clone(&media)) {
                                         Ok(()) => {
                                             if media_is_keyframe {
                                                 client.needs_keyframe = false;
@@ -714,7 +732,13 @@ pub(super) async fn make_factory(
                     }
                 },
                 msg_opt = client_rx.recv() => {
-                    if let Some(ClientMsg::NewClient { element, reply }) = msg_opt {
+                    if let Some(ClientMsg::NewClient { element, reply, deadline }) = msg_opt {
+                        if Instant::now() > deadline {
+                            log::info!(
+                                "{name}::{stream}: RTSP server already gave up on a client request, not building its pipeline"
+                            );
+                            continue;
+                        }
                         log::info!("New RTSP client for {name}::{stream}");
                         let build_result: AnyResult<(Option<AppSrc>, Option<AppSrc>)> = (|| {
                             clear_bin(&element)?;
@@ -788,10 +812,17 @@ pub(super) async fn make_factory(
                         };
 
                         log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
-                        let _ = reply.send(Ok(element));
+                        if reply.send(Ok(element)).is_err() {
+                            // The server thread stopped waiting while we were
+                            // building; the element is discarded with it.
+                            log::info!(
+                                "{name}::{stream}: RTSP server stopped waiting for the client pipeline, discarding it"
+                            );
+                            continue;
+                        }
 
                         let (tx, mut rx) =
-                            tokio::sync::mpsc::channel(CLIENT_MEDIA_QUEUE_CAPACITY);
+                            tokio::sync::mpsc::channel::<SharedMedia>(CLIENT_MEDIA_QUEUE_CAPACITY);
                         let client_cancel = CancellationToken::new();
                         let client_last_activity = Arc::new(Mutex::new(Instant::now()));
 
@@ -809,7 +840,6 @@ pub(super) async fn make_factory(
                             .spawn(move || {
                                 let name = sender_name;
                                 let mut timestamps = TimestampState::default();
-                                let mut pools = Default::default();
                                 let mut waiting_for_keyframe = bootstrap_needs_keyframe;
                                 let mut local_gen = thread_ts_gen.load(std::sync::atomic::Ordering::Acquire);
 
@@ -841,7 +871,6 @@ pub(super) async fn make_factory(
 
                                         match send_to_sources(
                                             buffered,
-                                            &mut pools,
                                             &vid_src,
                                             &aud_src,
                                             &mut timestamps,
@@ -882,7 +911,6 @@ pub(super) async fn make_factory(
 
                                             match send_to_sources(
                                                 data,
-                                                &mut pools,
                                                 &vid_src,
                                                 &aud_src,
                                                 &mut timestamps,
@@ -948,6 +976,7 @@ pub(super) async fn make_factory(
             .try_send(ClientMsg::NewClient {
                 element: element.clone().upcast(),
                 reply: tx,
+                deadline: Instant::now() + CLIENT_BUILD_TIMEOUT,
             })
             .ok();
 
@@ -955,7 +984,7 @@ pub(super) async fn make_factory(
         // upstream stream (reopen runs in the background), so this rarely waits
         // long. Allow a 2s margin for the loop to be momentarily busy fanning out
         // a large I-frame so a client connect isn't rejected spuriously.
-        let element = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        let element = match rx.recv_timeout(CLIENT_BUILD_TIMEOUT) {
             Ok(Ok(e)) => e,
             Ok(Err(e)) => return Err(e),
             Err(e) => {
@@ -971,14 +1000,13 @@ pub(super) async fn make_factory(
 }
 
 fn send_to_sources(
-    data: BcMedia,
-    pools: &mut HashMap<usize, (gstreamer::BufferPool, Instant)>,
+    data: SharedMedia,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
     timestamps: &mut TimestampState,
     stream_config: &StreamConfig,
 ) -> AnyResult<FrameSendOutcome> {
-    match data {
+    match &*data {
         BcMedia::Aac(aac) => {
             if let Some(duration) = aac.duration() {
                 if let Some(aud_src) = aud_src.as_ref() {
@@ -987,12 +1015,11 @@ fn send_to_sources(
                     let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
                     let sent = send_to_appsrc(
                         aud_src,
-                        aac.data,
+                        FramePayload(Arc::clone(&data)),
                         ts,
                         Some(pkt_duration),
                         true,
                         false,
-                        pools,
                         timestamps.audio_needs_discont,
                     )?;
                     if sent {
@@ -1010,12 +1037,11 @@ fn send_to_sources(
                     let ts = next_cumulative_timestamp(&mut timestamps.next_audio_ts, pkt_duration);
                     let sent = send_to_appsrc(
                         aud_src,
-                        adpcm.data,
+                        FramePayload(Arc::clone(&data)),
                         ts,
                         Some(pkt_duration),
                         true,
                         false,
-                        pools,
                         timestamps.audio_needs_discont,
                     )?;
                     if sent {
@@ -1025,26 +1051,23 @@ fn send_to_sources(
             }
             Ok(FrameSendOutcome::Sent)
         }
-        BcMedia::Iframe(BcMediaIframe {
-            data, microseconds, ..
-        }) => {
+        BcMedia::Iframe(BcMediaIframe { microseconds, .. }) => {
             let frame_interval = 1_000_000u64 / u64::from(stream_config.fps.max(1));
             if let Some(vid_src) = vid_src.as_ref() {
                 let pkt_duration = Duration::from_micros(frame_interval);
                 let ts = next_video_timestamp(
-                    microseconds,
+                    *microseconds,
                     &mut timestamps.last_video_source_ts,
                     &mut timestamps.next_video_ts,
                     pkt_duration,
                 );
                 let sent = send_to_appsrc(
                     vid_src,
-                    data,
+                    FramePayload(Arc::clone(&data)),
                     ts,
                     Some(pkt_duration),
                     false,
                     true,
-                    pools,
                     timestamps.video_needs_discont,
                 )?;
                 if sent {
@@ -1053,26 +1076,23 @@ fn send_to_sources(
             }
             Ok(FrameSendOutcome::Sent)
         }
-        BcMedia::Pframe(BcMediaPframe {
-            data, microseconds, ..
-        }) => {
+        BcMedia::Pframe(BcMediaPframe { microseconds, .. }) => {
             let frame_interval = 1_000_000u64 / u64::from(stream_config.fps.max(1));
             if let Some(vid_src) = vid_src.as_ref() {
                 let pkt_duration = Duration::from_micros(frame_interval);
                 let ts = next_video_timestamp(
-                    microseconds,
+                    *microseconds,
                     &mut timestamps.last_video_source_ts,
                     &mut timestamps.next_video_ts,
                     pkt_duration,
                 );
                 let sent = send_to_appsrc(
                     vid_src,
-                    data,
+                    FramePayload(Arc::clone(&data)),
                     ts,
                     Some(pkt_duration),
                     true,
                     true,
-                    pools,
                     timestamps.video_needs_discont,
                 )?;
                 if sent {
@@ -1145,12 +1165,11 @@ fn next_video_timestamp(
 
 fn send_to_appsrc(
     appsrc: &AppSrc,
-    data: Vec<u8>,
+    payload: FramePayload,
     ts: Duration,
     duration: Option<Duration>,
     can_drop: bool,
     is_video: bool,
-    pools: &mut HashMap<usize, (gstreamer::BufferPool, Instant)>,
     discont: bool,
 ) -> AnyResult<bool> {
     check_live(appsrc)?; // Stop if appsrc is dropped
@@ -1175,39 +1194,14 @@ fn send_to_appsrc(
         return Ok(false);
     }
 
-    let msg_size = data.len();
-
-    while pools.len() >= MAX_BUFFER_POOLS && !pools.contains_key(&msg_size) {
-        if let Some(&oldest_key) = pools
-            .iter()
-            .min_by_key(|(_, (_, last_used))| *last_used)
-            .map(|(k, _)| k)
-        {
-            if let Some((old_pool, _)) = pools.remove(&oldest_key) {
-                let _ = old_pool.set_active(false);
-            }
-        }
-    }
-
-    let (pool, last_used) = pools.entry(msg_size).or_insert_with_key(|size| {
-        let pool = gstreamer::BufferPool::new();
-        let mut pool_config = pool.config();
-        pool_config.set_params(None, (*size) as u32, 8, 32);
-        if let Err(e) = pool.set_config(pool_config) {
-            log::error!("Failed to configure buffer pool: {}", e);
-        }
-        if let Err(e) = pool.set_active(true) {
-            log::error!("Failed to activate buffer pool: {}", e);
-        }
-        (pool, Instant::now())
-    });
-    *last_used = Instant::now();
-
-    let buf = {
-        let mut new_buf = pool
-            .acquire_buffer(None)
-            .map_err(|e| anyhow::anyhow!("Failed to acquire buffer from pool: {e:?}"))?;
-        let gst_buf_mut = new_buf
+    // Wrap the shared frame allocation directly. The previous design kept up
+    // to 32 `GstBufferPool`s keyed by exact frame size, each preallocating 8
+    // buffers; since video frame sizes vary per frame this created and evicted
+    // a pool for nearly every frame (32 x 8 x frame size resident per client,
+    // all churned through glibc malloc) and copied every payload on top.
+    let mut buf = gstreamer::Buffer::from_slice(payload);
+    {
+        let gst_buf_mut = buf
             .get_mut()
             .ok_or_else(|| anyhow::anyhow!("Failed to get mutable buffer reference"))?;
 
@@ -1224,14 +1218,7 @@ fn send_to_appsrc(
                 duration.as_micros() as u64
             ));
         }
-
-        let mut gst_buf_data = gst_buf_mut
-            .map_writable()
-            .map_err(|e| anyhow::anyhow!("Failed to map buffer writable: {e:?}"))?;
-        gst_buf_data.copy_from_slice(data.as_slice());
-        drop(gst_buf_data);
-        new_buf
-    };
+    }
 
     match appsrc.push_buffer(buf) {
         Ok(_) => Ok(true),
@@ -1242,9 +1229,9 @@ fn send_to_appsrc(
 }
 
 fn drain_latest_batch_with_cancel(
-    rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
+    rx: &mut tokio::sync::mpsc::Receiver<SharedMedia>,
     cancel: &CancellationToken,
-) -> Option<Vec<BcMedia>> {
+) -> Option<Vec<SharedMedia>> {
     loop {
         if cancel.is_cancelled() {
             return None;
@@ -1265,7 +1252,7 @@ fn drain_latest_batch_with_cancel(
                 // slightly behind we keep every frame; `send_to_appsrc` still
                 // applies keyframe-aware backpressure downstream if needed.
                 if batch.len() >= DRAIN_CATCHUP_THRESHOLD {
-                    if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
+                    if let Some(last_iframe) = batch.iter().rposition(|m| is_keyframe(m)) {
                         if last_iframe > 0 {
                             log::debug!(
                                 "RTSP consumer far behind ({} frames queued); catching up to latest keyframe",
@@ -1288,8 +1275,8 @@ fn drain_latest_batch_with_cancel(
     }
 }
 
-fn prepare_bootstrap_batch(batch: &mut Vec<BcMedia>) -> bool {
-    if let Some(last_iframe) = batch.iter().rposition(is_keyframe) {
+fn prepare_bootstrap_batch(batch: &mut Vec<SharedMedia>) -> bool {
+    if let Some(last_iframe) = batch.iter().rposition(|m| is_keyframe(m)) {
         if last_iframe > 0 {
             let _ = batch.drain(0..last_iframe);
         }
@@ -1991,21 +1978,30 @@ fn buffer_size(bitrate: u32) -> u32 {
 mod tests {
     use super::*;
 
-    fn sample_iframe() -> BcMedia {
-        BcMedia::Iframe(BcMediaIframe {
+    fn sample_iframe() -> SharedMedia {
+        Arc::new(BcMedia::Iframe(BcMediaIframe {
             video_type: VideoType::H264,
             microseconds: 1,
             time: None,
             data: vec![1, 2, 3, 4],
-        })
+        }))
     }
 
-    fn sample_pframe() -> BcMedia {
-        BcMedia::Pframe(BcMediaPframe {
+    fn sample_pframe() -> SharedMedia {
+        Arc::new(BcMedia::Pframe(BcMediaPframe {
             video_type: VideoType::H264,
             microseconds: 2,
             data: vec![5, 6, 7, 8],
-        })
+        }))
+    }
+
+    #[test]
+    fn test_frame_payload_exposes_data_without_copy() {
+        let frame = sample_iframe();
+        let payload = FramePayload(Arc::clone(&frame));
+        assert_eq!(payload.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(Arc::strong_count(&frame), 2);
+        assert!(FramePayload(Arc::new(BcMedia::Skip)).as_ref().is_empty());
     }
 
     /// Verify audio buffer size is reasonable
@@ -2096,28 +2092,6 @@ mod tests {
         );
     }
 
-    /// Verify buffer pool limits prevent memory leaks
-    #[test]
-    fn test_buffer_pool_limits() {
-        // MAX_BUFFER_POOLS limits how many different frame-size pools we maintain
-        // This prevents memory leaks from cameras with variable frame sizes
-        assert!(
-            MAX_BUFFER_POOLS >= 16,
-            "Too few buffer pools, may cause excessive eviction"
-        );
-        assert!(
-            MAX_BUFFER_POOLS <= 64,
-            "Too many buffer pools allowed, memory leak risk"
-        );
-
-        // Video frames typically cluster around a few sizes:
-        // - I-frames: 50-100KB (few different sizes)
-        // - P-frames: 5-20KB (few different sizes)
-        // - Audio: 512-2KB (consistent size)
-        // 32 pools should be more than enough
-        assert_eq!(MAX_BUFFER_POOLS, 32, "Expected 32 buffer pools");
-    }
-
     /// Verify timestamp types can handle long-running streams
     #[test]
     fn test_timestamp_no_overflow() {
@@ -2186,8 +2160,14 @@ mod tests {
         let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new())
             .expect("expected batch");
         assert_eq!(drained.len(), 3);
-        assert!(matches!(drained.first(), Some(BcMedia::Pframe(_))));
-        assert!(matches!(drained.last(), Some(BcMedia::Pframe(_))));
+        assert!(matches!(
+            drained.first().map(|m| &**m),
+            Some(BcMedia::Pframe(_))
+        ));
+        assert!(matches!(
+            drained.last().map(|m| &**m),
+            Some(BcMedia::Pframe(_))
+        ));
     }
 
     #[test]
@@ -2203,8 +2183,14 @@ mod tests {
         let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new())
             .expect("expected batch");
         assert_eq!(drained.len(), 4, "small batch should not be trimmed");
-        assert!(matches!(drained.first(), Some(BcMedia::Pframe(_))));
-        assert!(matches!(drained.last(), Some(BcMedia::Pframe(_))));
+        assert!(matches!(
+            drained.first().map(|m| &**m),
+            Some(BcMedia::Pframe(_))
+        ));
+        assert!(matches!(
+            drained.last().map(|m| &**m),
+            Some(BcMedia::Pframe(_))
+        ));
     }
 
     #[test]
@@ -2228,8 +2214,14 @@ mod tests {
             2,
             "large batch should be trimmed to the latest keyframe onward"
         );
-        assert!(matches!(drained.first(), Some(BcMedia::Iframe(_))));
-        assert!(matches!(drained.last(), Some(BcMedia::Pframe(_))));
+        assert!(matches!(
+            drained.first().map(|m| &**m),
+            Some(BcMedia::Iframe(_))
+        ));
+        assert!(matches!(
+            drained.last().map(|m| &**m),
+            Some(BcMedia::Pframe(_))
+        ));
     }
 
     #[test]
@@ -2244,7 +2236,10 @@ mod tests {
 
         assert!(!needs_keyframe);
         assert_eq!(batch.len(), 2);
-        assert!(matches!(batch.first(), Some(BcMedia::Iframe(_))));
+        assert!(matches!(
+            batch.first().map(|m| &**m),
+            Some(BcMedia::Iframe(_))
+        ));
     }
 
     #[test]
@@ -2254,7 +2249,10 @@ mod tests {
 
         assert!(needs_keyframe);
         assert_eq!(batch.len(), 1);
-        assert!(matches!(batch.first(), Some(BcMedia::Pframe(_))));
+        assert!(matches!(
+            batch.first().map(|m| &**m),
+            Some(BcMedia::Pframe(_))
+        ));
     }
 
     #[test]
@@ -2267,7 +2265,10 @@ mod tests {
         ts.audio_needs_discont = false;
         assert!(ts.align_audio_to_video());
         assert_eq!(ts.next_audio_ts, Duration::from_secs(30));
-        assert!(ts.audio_needs_discont, "a snap must be flagged as a discontinuity");
+        assert!(
+            ts.audio_needs_discont,
+            "a snap must be flagged as a discontinuity"
+        );
     }
 
     #[test]

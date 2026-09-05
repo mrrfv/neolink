@@ -1361,7 +1361,8 @@ fn warn_if_container_address(ip: std::net::IpAddr) {
     };
     let [a, b, _, _] = v4.octets();
     // podman default (10.88/16, 10.89/16) and docker default (172.16/12)
-    let looks_like_container = (a == 10 && (b == 88 || b == 89)) || (a == 172 && (16..=31).contains(&b));
+    let looks_like_container =
+        (a == 10 && (b == 88 || b == 89)) || (a == 172 && (16..=31).contains(&b));
     if looks_like_container && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         log::warn!(
             "Registering {} with Reolink: this looks like a container bridge address that the camera cannot reach. Local discovery will fail and every reconnect will go through Reolink's servers. For battery/WiFi cameras run neolink with host networking (e.g. `--network=host`).",
