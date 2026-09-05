@@ -77,7 +77,10 @@ RUN gst-inspect-1.0; \
     "/usr/local/bin/neolink" --version && \
     mkdir -m 0700 /root/.config/
 
-ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554
+# GStreamer and GLib allocate through glibc malloc (the Rust side uses
+# jemalloc). Bounding glibc's per-thread arenas keeps the RSS of the per-client
+# sender threads from creeping up over long uptimes.
+ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554 MALLOC_ARENA_MAX=2
 
 CMD /usr/local/bin/neolink "${NEO_LINK_MODE}" --config /etc/neolink.toml
 ENTRYPOINT ["/entrypoint.sh"]

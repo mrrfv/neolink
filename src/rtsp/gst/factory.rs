@@ -54,7 +54,13 @@ impl NeoMediaFactory {
         // the parsed BcMedia packets without mutating a live RTSP pipeline.
         factory.set_shared(false);
         factory.set_eos_shutdown(false);
-        factory.set_stop_on_disconnect(false);
+        // Every media has exactly one client (shared = false), so when that
+        // client's connection goes away there is nobody left to feed. Stopping
+        // the media right away frees its pipeline and lets the sender thread
+        // notice ("App source is closed") within seconds. Keeping it alive
+        // until the RTSP session timed out left whole pipelines running for
+        // minutes after each go2rtc/ffmpeg reconnect during an outage.
+        factory.set_stop_on_disconnect(true);
         factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::Reset);
         factory.set_launch(launch);
         factory.set_transport_mode(RTSPTransportMode::PLAY);

@@ -31,12 +31,15 @@ use tokio_util::sync::CancellationToken;
 /// RTSP session timeout in seconds
 ///
 /// Controls how long an idle RTSP session persists before being dropped.
-/// Aligned with TCP keepalive (120s) for consistent connection lifecycle.
+/// Clients refresh it with keepalive requests (RTSP clients send them at
+/// roughly half the advertised timeout), so this only bites a client that
+/// vanished without a TEARDOWN, and then it bounds how long its pipeline is
+/// kept alive.
 ///
 /// Trade-offs:
 /// - Shorter = faster cleanup of stale sessions, less memory
 /// - Longer = more resilient to network jitter and slow clients
-const RTSP_SESSION_TIMEOUT_SECS: u32 = 120;
+const RTSP_SESSION_TIMEOUT_SECS: u32 = 60;
 
 glib::wrapper! {
     /// The wrapped RTSPServer
@@ -295,11 +298,11 @@ mod tests {
             "RTSP session timeout too long, may accumulate stale sessions"
         );
 
-        // Should be aligned with TCP keepalive for consistency
-        // TCP keepalive is typically 120s
+        // Must leave room for a client's keepalive cadence (half the timeout)
+        // plus jitter.
         assert!(
-            RTSP_SESSION_TIMEOUT_SECS >= 120,
-            "RTSP timeout should be >= TCP keepalive (120s)"
+            RTSP_SESSION_TIMEOUT_SECS >= 30,
+            "RTSP timeout too short for client keepalives"
         );
     }
 }
