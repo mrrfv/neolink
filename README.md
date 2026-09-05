@@ -424,6 +424,8 @@ ssue a user had)
 - **print_format:** Used for adjusting printing of some values mostly, battery
 messages
 - **protocol:** Controls the underlying Baichuan transport. `Udp` is the default, `Tcp` is useful on especially noisy LANs, and `TcpUdp` lets NeoLink try both. If you only configure an address and no `uid`, NeoLink falls back to `Tcp` because UDP discovery needs a UID.
+- **audio_passthrough:** Send the camera's AAC audio through RTSP unchanged (`MPEG4-GENERIC`, one RTP packet per frame) instead of decoding it to raw L16 PCM. Default `true`. See [Frigate / go2rtc](#frigate--go2rtc).
+- **strict:** Default `false`: a corrupt or partially lost media packet is skipped and video resumes at the next keyframe. `true` ends the stream on the first bad packet so it has to be restarted from the camera.
 
 ### Pause
 
@@ -521,6 +523,52 @@ There are currently 2 environmental variables available as part of the container
 
 - `NEO_LINK_MODE`: defaults to `"rtsp"` if not set, other options are "mqtt" or "mqtt-rtsp".
 - `NEO_LINK_PORT`: defaults to `8554`, set this to your required port value.
+
+### Frigate / go2rtc
+
+The recommended way to feed Frigate is through its bundled go2rtc restream,
+with Frigate's ffmpeg processes reading from go2rtc:
+
+```yaml
+# go2rtc
+streams:
+  side_sub: rtsp://neolink:8554/side/subStream
+```
+
+```yaml
+# frigate
+cameras:
+  side:
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/side_sub
+          input_args: preset-rtsp-restream
+          roles: [detect, record, audio]
+      output_args:
+        record: preset-record-generic-audio-copy
+```
+
+`input_args: preset-rtsp-restream` matters. Frigate's default input preset
+(`preset-rtsp-generic`) adds `-use_wallclock_as_timestamps 1`, which makes
+ffmpeg stamp packets with their arrival time instead of the RTP timestamp. Any
+frame that spans more than one RTP packet then yields two packets with the same
+timestamp, and ffmpeg logs `non monotonically increasing dts` and drops them
+(neolink used to send decoded PCM audio as two packets per frame, so this hit
+every audio frame). The restream preset is the right choice for any go2rtc-fed
+input.
+
+With the default `audio_passthrough = true` the RTSP audio track is the camera's
+AAC (`MPEG4-GENERIC`): one packet per frame, no decoding in neolink, and Frigate
+can record it with `-c:a copy`. Set `audio_passthrough = false` to get the old
+raw L16 PCM track instead.
+
+For battery / WiFi cameras (Lumus, Argus) run the neolink container with host
+networking (`--network=host`, or a macvlan network). On a bridge network the
+camera cannot answer local discovery, so every reconnect goes through Reolink's
+cloud (`Trying remote discovery` in the log), which takes 3-60 s and depends on
+Reolink's servers. Serve only the stream Frigate uses (`stream = "subStream"`)
+and keep `strict = false` (the default) so a corrupt or lost packet costs a few
+frames instead of a stream restart.
 
 ### Image
 

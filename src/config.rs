@@ -172,8 +172,20 @@ pub(crate) struct CameraConfig {
     pub(crate) max_encryption: String,
 
     #[serde(default = "default_strict")]
-    /// If strict then the media stream will error in the event that the media packets are not as expected
+    /// If strict then the media stream will error in the event that the media packets are not as expected.
+    ///
+    /// Defaults to `false`: a corrupt or partially lost media packet is skipped
+    /// and video resumes at the next keyframe. With `true` the same event ends
+    /// the stream and it has to be restarted from the camera.
     pub(crate) strict: bool,
+
+    /// Send the camera's AAC audio through RTSP as-is (`MPEG4-GENERIC`) instead
+    /// of decoding it to raw L16 PCM. Passthrough means one RTP packet per
+    /// audio frame and no decode CPU; it is what Frigate/go2rtc/ffmpeg expect
+    /// from an IP camera and lets Frigate record audio with `-c:a copy`.
+    /// Set to `false` to restore the old L16 behaviour.
+    #[serde(default = "default_true")]
+    pub(crate) audio_passthrough: bool,
 
     #[serde(default = "default_print", alias = "print")]
     pub(crate) print_format: PrintFormat,

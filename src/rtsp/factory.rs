@@ -118,9 +118,12 @@ struct StreamConfig {
     fps_table: Vec<u32>,
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
+    /// Pass AAC through as MPEG4-GENERIC instead of decoding to L16.
+    audio_passthrough: bool,
 }
 impl StreamConfig {
     async fn new(instance: &NeoInstance, name: StreamKind) -> AnyResult<Self> {
+        let audio_passthrough = instance.config().await?.borrow().audio_passthrough;
         let (resolution, bitrate, fps, fps_table, bitrate_table) = instance
             .run_passive_task(|cam| {
                 Box::pin(async move {
@@ -180,6 +183,7 @@ impl StreamConfig {
             bitrate_table,
             vid_type: None,
             aud_type: None,
+            audio_passthrough,
         })
     }
 
@@ -1525,13 +1529,92 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
     Ok(linked.appsrc)
 }
 
+/// Common appsrc setup for the AAC input, shared by the passthrough and the
+/// decode-to-L16 pipelines.
+fn make_aac_appsrc(buffer_size: u32) -> Result<AppSrc> {
+    let source = make_element("appsrc", "audsrc")?
+        .dynamic_cast::<AppSrc>()
+        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
+    source.set_is_live(true);
+    source.set_block(false);
+    source.set_min_latency(20_000_000);
+    source.set_property("emit-signals", false);
+    source.set_max_bytes(buffer_size as u64);
+    source.set_leaky_type(AppLeakyType::Downstream);
+    source.set_do_timestamp(false);
+    source.set_format(gstreamer::Format::Time);
+    source.set_stream_type(AppStreamType::Stream);
+    // The camera sends ADTS-framed AAC (see `BcMediaAac::duration`, which
+    // parses the ADTS header).
+    source.set_caps(Some(
+        &Caps::builder("audio/mpeg")
+            .field("mpegversion", 4i32)
+            .field("stream-format", "adts")
+            .build(),
+    ));
+    Ok(source)
+}
+
+/// AAC passthrough: `appsrc ! aacparse` feeding `rtpmp4gpay`.
+///
+/// One RTP packet per AAC frame, no decode. Decoding to L16 produced 2048-byte
+/// PCM frames that `rtpL16pay` split into two RTP packets per frame; clients
+/// that timestamp by arrival time (Frigate's default `preset-rtsp-generic`
+/// passes `-use_wallclock_as_timestamps 1`) then saw two packets with the same
+/// timestamp and logged/dropped every one of them as a non-monotonic DTS.
 fn pipe_aac(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> {
     let buffer_size = AUDIO_BUFFER_SIZE;
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
-    log::debug!("Building Aac pipeline");
+    log::debug!("Building Aac passthrough pipeline");
+    let source = make_aac_appsrc(buffer_size)?
+        .dynamic_cast::<Element>()
+        .map_err(|_| anyhow!("Cannot cast back"))?;
+
+    let queue = make_queue("audqueue", buffer_size)?;
+    // aacparse re-frames ADTS to raw AAC (with codec_data for the SDP) when
+    // the downstream payloader asks for `stream-format=raw`.
+    let parser = make_element("aacparse", "audparser")?;
+
+    bin.add_many([&source, &queue, &parser])?;
+    Element::link_many([&source, &queue, &parser])?;
+
+    let source = source
+        .dynamic_cast::<AppSrc>()
+        .map_err(|_| anyhow!("Cannot convert appsrc"))?;
+    Ok(Linked {
+        appsrc: source,
+        output: parser,
+    })
+}
+
+fn build_aac(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
+    if !stream_config.audio_passthrough {
+        return build_aac_l16(bin, stream_config);
+    }
+    let linked = pipe_aac(bin, stream_config)?;
+
+    let bin = bin
+        .clone()
+        .dynamic_cast::<Bin>()
+        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
+
+    let payload = make_element("rtpmp4gpay", "pay1")?;
+    bin.add_many([&payload])?;
+    Element::link_many([&linked.output, &payload])?;
+    Ok(linked.appsrc)
+}
+
+/// Legacy AAC path: decode to L16 PCM (`audio_passthrough = false`).
+fn pipe_aac_l16(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> {
+    let buffer_size = AUDIO_BUFFER_SIZE;
+    let bin = bin
+        .clone()
+        .dynamic_cast::<Bin>()
+        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
+    log::debug!("Building Aac decode pipeline");
     let source = make_element("appsrc", "audsrc")?
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
@@ -1578,18 +1661,30 @@ fn pipe_aac(bin: &Element, _stream_config: &StreamConfig) -> Result<Linked> {
     })
 }
 
-fn build_aac(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
-    let linked = pipe_aac(bin, stream_config)?;
+fn build_aac_l16(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
+    let linked = pipe_aac_l16(bin, stream_config)?;
 
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
-    let payload = make_element("rtpL16pay", "pay1")?;
+    let payload = make_l16_payloader()?;
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
+}
+
+/// `rtpL16pay` sized so one decoded audio block fits in one RTP packet.
+///
+/// The default 1400-byte MTU splits a 2048-byte (1024 sample, 16-bit mono)
+/// block into two RTP packets. Clients that timestamp by arrival time then see
+/// two packets with the same timestamp and treat the second as a DTS error.
+/// RTSP clients use TCP interleaving where a 4 KiB RTP packet is fine.
+fn make_l16_payloader() -> AnyResult<Element> {
+    let payload = make_element("rtpL16pay", "pay1")?;
+    payload.set_property("mtu", 4096u32);
+    Ok(payload)
 }
 
 fn pipe_adpcm(bin: &Element, block_size: u32, _stream_config: &StreamConfig) -> Result<Linked> {
@@ -1673,7 +1768,7 @@ fn build_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> 
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
-    let payload = make_element("rtpL16pay", "pay1")?;
+    let payload = make_l16_payloader()?;
     bin.add_many([&payload])?;
     Element::link_many([&linked.output, &payload])?;
     Ok(linked.appsrc)
@@ -1802,6 +1897,7 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
             "rtpjitterbuffer" => "rtp (gst-plugins-good)",
             "aacparse" => "audioparsers (gst-plugins-good)",
             "rtpL16pay" => "rtp (gst-plugins-good)",
+            "rtpmp4gpay" => "rtp (gst-plugins-good)",
             "x264enc" => "x264 (gst-plugins-ugly)",
             "x265enc" => "x265 (gst-plugins-bad)",
             "avdec_h264" => "libav (gst-libav)",

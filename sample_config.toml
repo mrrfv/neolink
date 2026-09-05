@@ -66,6 +66,16 @@ address = "192.168.1.187:9000"
 # If you only configure an address and no uid, NeoLink falls back to Tcp because UDP needs a uid.
 # protocol = "Udp"
 
+# Send the camera's AAC audio through RTSP as-is (MPEG4-GENERIC, one RTP packet
+# per frame). This is what NVRs such as Frigate expect and lets them record the
+# audio without re-encoding. Set to false to decode to raw L16 PCM instead.
+# audio_passthrough = true
+
+# When false (default) a corrupt or lost media packet is skipped and video
+# resumes at the next keyframe. When true the stream is stopped and restarted
+# from the camera instead.
+# strict = false
+
 # By default neolink will use any means to connect to the camera
 # from a UID
 # This include relaying via reolink servers
