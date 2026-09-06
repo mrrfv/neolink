@@ -563,8 +563,10 @@ input.
 
 With the default `audio_passthrough = true` the RTSP audio track is the camera's
 AAC (`MPEG4-GENERIC`): one packet per frame, no decoding in neolink, and Frigate
-can record it with `-c:a copy`. Set `audio_passthrough = false` to get the old
-raw L16 PCM track instead.
+can record it with `-c:a copy`. Reolink cameras label their ADTS frames as
+MPEG-2; neolink relabels them as MPEG-4 (the AAC-LC payload is identical) so the
+`MPEG4-GENERIC` payloader accepts them. Set `audio_passthrough = false` to get
+the old raw L16 PCM track instead.
 
 For battery / WiFi cameras (Lumus, Argus) run the neolink container with host
 networking (`--network=host`, or a macvlan network). On a bridge network the

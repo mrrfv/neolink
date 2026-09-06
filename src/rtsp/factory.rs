@@ -439,6 +439,19 @@ fn is_keyframe(media: &BcMedia) -> bool {
     media.is_keyframe()
 }
 
+/// Reolink cameras label their ADTS frames as MPEG-2 (ID bit of the header
+/// set). The AAC-LC payload is identical to MPEG-4 ADTS, but `aacparse` copies
+/// that bit into `mpegversion` on its caps and `rtpmp4gpay` only accepts
+/// `mpegversion=4`, so without this the audio branch never negotiates, the
+/// whole media fails to preroll and every DESCRIBE is answered with 503.
+fn normalise_adts_mpeg4(media: &mut BcMedia) {
+    if let BcMedia::Aac(aac) = media {
+        if aac.data.len() >= 2 && aac.data[0] == 0xFF && aac.data[1] & 0xF0 == 0xF0 {
+            aac.data[1] &= !0x08;
+        }
+    }
+}
+
 fn media_kind_str(media: &BcMedia) -> &'static str {
     match media {
         BcMedia::Iframe(_) => "Iframe",
@@ -525,7 +538,8 @@ pub(super) async fn make_factory(
                     .unwrap_or(INITIAL_VIDEO_TIMEOUT);
 
                 match timeout(wait_for, media_rx.recv()).await {
-                    Ok(Some(media)) => {
+                    Ok(Some(mut media)) => {
+                        normalise_adts_mpeg4(&mut media);
                         stream_config.update_from_media(&media);
                         buffer_media(&mut buffer, Arc::new(media));
                     }
@@ -648,8 +662,9 @@ pub(super) async fn make_factory(
                 }
                 media_opt = media_rx.recv(), if !reopening => {
                     match media_opt {
-                        Some(media) => {
+                        Some(mut media) => {
                             last_media_received = Instant::now();
+                            normalise_adts_mpeg4(&mut media);
                             let media: SharedMedia = Arc::new(media);
                             stream_config.update_from_media(&media);
                             if waiting_for_keyframe {
@@ -1977,6 +1992,7 @@ fn buffer_size(bitrate: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neolink_core::bcmedia::model::BcMediaAac;
 
     fn sample_iframe() -> SharedMedia {
         Arc::new(BcMedia::Iframe(BcMediaIframe {
@@ -1993,6 +2009,66 @@ mod tests {
             microseconds: 2,
             data: vec![5, 6, 7, 8],
         }))
+    }
+
+    /// ADTS header (7 bytes) for AAC-LC, 16 kHz mono, with the MPEG-2 ID bit
+    /// set, as the Reolink Lumus sends it.
+    fn mpeg2_adts_frame() -> Vec<u8> {
+        vec![0xFF, 0xF9, 0x60, 0x40, 0x02, 0x1F, 0xFC, 0xAA, 0xBB]
+    }
+
+    #[test]
+    fn test_normalise_adts_clears_mpeg2_id_bit() {
+        let mut media = BcMedia::Aac(BcMediaAac {
+            data: mpeg2_adts_frame(),
+        });
+        normalise_adts_mpeg4(&mut media);
+        match &media {
+            BcMedia::Aac(aac) => {
+                assert_eq!(aac.data[1], 0xF1, "ID bit must be cleared");
+                assert_eq!(
+                    &aac.data[2..],
+                    &mpeg2_adts_frame()[2..],
+                    "payload untouched"
+                );
+            }
+            _ => panic!("media kind changed"),
+        }
+    }
+
+    #[test]
+    fn test_normalise_adts_leaves_mpeg4_frame_unchanged() {
+        let mut data = mpeg2_adts_frame();
+        data[1] = 0xF1;
+        let expected = data.clone();
+        let mut media = BcMedia::Aac(BcMediaAac { data });
+        normalise_adts_mpeg4(&mut media);
+        match &media {
+            BcMedia::Aac(aac) => assert_eq!(aac.data, expected),
+            _ => panic!("media kind changed"),
+        }
+    }
+
+    #[test]
+    fn test_normalise_adts_ignores_non_adts_and_non_audio() {
+        let mut short = BcMedia::Aac(BcMediaAac { data: vec![0xFF] });
+        normalise_adts_mpeg4(&mut short);
+        assert!(matches!(&short, BcMedia::Aac(a) if a.data == vec![0xFF]));
+
+        let mut no_sync = BcMedia::Aac(BcMediaAac {
+            data: vec![0x00, 0xF9, 0x60],
+        });
+        normalise_adts_mpeg4(&mut no_sync);
+        assert!(matches!(&no_sync, BcMedia::Aac(a) if a.data == vec![0x00, 0xF9, 0x60]));
+
+        let mut video = BcMedia::Iframe(BcMediaIframe {
+            video_type: VideoType::H264,
+            microseconds: 1,
+            time: None,
+            data: vec![0xFF, 0xF9],
+        });
+        normalise_adts_mpeg4(&mut video);
+        assert!(matches!(&video, BcMedia::Iframe(f) if f.data == vec![0xFF, 0xF9]));
     }
 
     #[test]

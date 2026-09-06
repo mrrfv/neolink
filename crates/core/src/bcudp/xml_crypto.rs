@@ -5,7 +5,7 @@ const XML_KEY: [u32; 8] = [
 pub(crate) fn decrypt(offset: u32, buf: &[u8]) -> Vec<u8> {
     let key = XML_KEY
         .iter()
-        .flat_map(|i| (i + offset).to_le_bytes())
+        .flat_map(|i| i.wrapping_add(offset).to_le_bytes())
         .cycle();
     buf.iter().zip(key).map(|(byte, key)| key ^ byte).collect()
 }
