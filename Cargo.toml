@@ -46,6 +46,7 @@ validator = {version="0.18.1", features = ["derive"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.5"
+tikv-jemalloc-ctl = "0.5"
 
 [features]
 default = ["gstreamer"]

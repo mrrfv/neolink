@@ -80,6 +80,59 @@ use gst::NeoRtspServer;
 
 type AnyResult<T> = anyhow::Result<T, anyhow::Error>;
 
+/// Cadence of the `METRIC event=memory` log line.
+const MEMORY_METRIC_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Resident set size (kB) and thread count of this process, Linux only.
+fn proc_self_status() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mut rss_kb = None;
+    let mut threads = None;
+    for line in status.lines() {
+        if let Some(v) = line.strip_prefix("VmRSS:") {
+            rss_kb = v.trim().trim_end_matches("kB").trim().parse::<u64>().ok();
+        } else if let Some(v) = line.strip_prefix("Threads:") {
+            threads = v.trim().parse::<u64>().ok();
+        }
+    }
+    Some((rss_kb?, threads?))
+}
+
+/// Bytes currently allocated by Rust code and bytes jemalloc keeps resident,
+/// both in kB.
+#[cfg(not(target_env = "msvc"))]
+fn jemalloc_stats_kb() -> Option<(u64, u64)> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    // Statistics are cached until the epoch is advanced.
+    epoch::advance().ok()?;
+    let allocated = stats::allocated::read().ok()? as u64 / 1024;
+    let resident = stats::resident::read().ok()? as u64 / 1024;
+    Some((allocated, resident))
+}
+
+#[cfg(target_env = "msvc")]
+fn jemalloc_stats_kb() -> Option<(u64, u64)> {
+    None
+}
+
+/// One log line per minute that attributes memory use: the jemalloc figures
+/// are the Rust heap, RSS is everything including GStreamer/GLib (glibc).
+/// RSS climbing while jemalloc stays flat points at native allocations or
+/// glibc arena retention (`MALLOC_ARENA_MAX=2` in the image bounds the latter).
+fn log_memory_metrics() {
+    let fmt = |v: Option<u64>| v.map_or_else(|| "n/a".to_string(), |v| v.to_string());
+    let (rss_kb, threads) = proc_self_status().map_or((None, None), |(r, t)| (Some(r), Some(t)));
+    let (allocated_kb, resident_kb) =
+        jemalloc_stats_kb().map_or((None, None), |(a, r)| (Some(a), Some(r)));
+    log::info!(
+        "METRIC event=memory rss_kb={} threads={} jemalloc_allocated_kb={} jemalloc_resident_kb={}",
+        fmt(rss_kb),
+        fmt(threads),
+        fmt(allocated_kb),
+        fmt(resident_kb)
+    );
+}
+
 fn spawn_camera_task(
     set: &mut JoinSet<AnyResult<String>>,
     cameras: &mut HashMap<String, CancellationToken>,
@@ -176,6 +229,21 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
                     }
                 }
             } => v
+        }
+    });
+
+    // Periodic memory report so growth can be attributed from the logs alone:
+    // jemalloc figures cover the Rust heap, RSS covers everything including
+    // GStreamer/GLib (glibc malloc).
+    let thread_cancel = global_cancel.clone();
+    set.spawn(async move {
+        let mut tick = interval(MEMORY_METRIC_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = thread_cancel.cancelled() => break AnyResult::Ok(()),
+                _ = tick.tick() => log_memory_metrics(),
+            }
         }
     });
 

@@ -86,6 +86,13 @@ const REOPEN_MAX_DELAY: Duration = Duration::from_secs(30);
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// How often to sweep stale RTSP clients when the camera is quiet.
 const CLIENT_REAP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a sender thread sleeps between polls of its (empty) media queue.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Every this many idle polls (~1 s) a parked sender checks whether its
+/// GStreamer pipeline still exists, so a client that left during a camera
+/// outage is released without waiting for the next frame.
+const IDLE_LIVENESS_POLLS: u32 = 200;
 /// If the audio output clock falls this far behind the video output clock, snap
 /// it forward (never backward) so a reconnect gap never turns into permanent
 /// A/V lag for a connected client.
@@ -904,7 +911,17 @@ pub(super) async fn make_factory(
                                     }
 
                                     log::trace!("Sending new frames");
-                                while let Some(mut batch) = drain_latest_batch_with_cancel(&mut rx, &thread_cancel) {
+                                    // While the camera is silent nothing is pushed
+                                    // into the appsrcs, so a client whose media was
+                                    // already torn down (disconnect, session
+                                    // timeout) would park here until the camera
+                                    // returned. Poll the pipeline while idle so the
+                                    // thread exits and the reaper drops the client.
+                                    let pipeline_dead = || {
+                                        vid_src.as_ref().is_some_and(|s| check_live(s).is_err())
+                                            || aud_src.as_ref().is_some_and(|s| check_live(s).is_err())
+                                    };
+                                while let Some(mut batch) = drain_latest_batch_with_cancel(&mut rx, &thread_cancel, &pipeline_dead) {
                                     for data in batch.drain(..) {
                                         touch_client_activity(&thread_last_activity);
                                         // Check if the main loop signaled a stream reconnect
@@ -942,6 +959,9 @@ pub(super) async fn make_factory(
                                                 }
                                             }
                                         }
+                                    }
+                                    if pipeline_dead() {
+                                        log::debug!("{name}::{stream}: RTSP client pipeline gone while idle, releasing sender");
                                     }
                                 }
                                 log::trace!("All media received");
@@ -1243,10 +1263,17 @@ fn send_to_appsrc(
     }
 }
 
+/// Wait for the next batch of media for one client.
+///
+/// Returns `None` when the client is cancelled, its queue is closed, or
+/// `pipeline_dead` reports (checked about once a second while idle) that the
+/// client's GStreamer pipeline has been torn down.
 fn drain_latest_batch_with_cancel(
     rx: &mut tokio::sync::mpsc::Receiver<SharedMedia>,
     cancel: &CancellationToken,
+    pipeline_dead: &dyn Fn() -> bool,
 ) -> Option<Vec<SharedMedia>> {
+    let mut idle_polls: u32 = 0;
     loop {
         if cancel.is_cancelled() {
             return None;
@@ -1283,7 +1310,11 @@ fn drain_latest_batch_with_cancel(
                 return Some(batch);
             }
             Err(TryRecvError::Empty) => {
-                std::thread::sleep(Duration::from_millis(5));
+                idle_polls += 1;
+                if idle_polls % IDLE_LIVENESS_POLLS == 0 && pipeline_dead() {
+                    return None;
+                }
+                std::thread::sleep(IDLE_POLL_INTERVAL);
             }
             Err(TryRecvError::Disconnected) => return None,
         }
@@ -2072,6 +2103,29 @@ mod tests {
     }
 
     #[test]
+    fn test_drain_returns_none_when_pipeline_dead_while_idle() {
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<SharedMedia>(4);
+        let start = Instant::now();
+        let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new(), &|| true);
+        assert!(drained.is_none(), "a dead pipeline must end the drain");
+        let waited = start.elapsed();
+        assert!(
+            waited >= IDLE_POLL_INTERVAL * (IDLE_LIVENESS_POLLS - 1)
+                && waited < Duration::from_secs(5),
+            "liveness is checked about once a second, waited {:?}",
+            waited
+        );
+    }
+
+    #[test]
+    fn test_drain_returns_none_when_queue_closed() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SharedMedia>(4);
+        drop(tx);
+        let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new(), &|| false);
+        assert!(drained.is_none());
+    }
+
+    #[test]
     fn test_frame_payload_exposes_data_without_copy() {
         let frame = sample_iframe();
         let payload = FramePayload(Arc::clone(&frame));
@@ -2233,7 +2287,7 @@ mod tests {
             tx.try_send(media).unwrap();
         }
 
-        let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new())
+        let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new(), &|| false)
             .expect("expected batch");
         assert_eq!(drained.len(), 3);
         assert!(matches!(
@@ -2256,7 +2310,7 @@ mod tests {
         tx.try_send(sample_iframe()).unwrap();
         tx.try_send(sample_pframe()).unwrap();
 
-        let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new())
+        let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new(), &|| false)
             .expect("expected batch");
         assert_eq!(drained.len(), 4, "small batch should not be trimmed");
         assert!(matches!(
@@ -2283,7 +2337,7 @@ mod tests {
         tx.try_send(sample_iframe()).unwrap();
         tx.try_send(sample_pframe()).unwrap();
 
-        let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new())
+        let drained = drain_latest_batch_with_cancel(&mut rx, &CancellationToken::new(), &|| false)
             .expect("expected batch");
         assert_eq!(
             drained.len(),
